@@ -1,35 +1,61 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Annotated, Literal
 
 import typer
+import yaml
 
-from clawake.config import InstanceSpec, Inventory, load_inventory
-from clawake.services.gateway_config import ensure_control_ui_config
-from clawake.services.render import render_instance_assets
+from clawake.config import ImageSpec, InstanceSpec, Inventory, load_inventory
+from clawake.services.backup import backup_instance, prune_backups
+from clawake.services.deployment import apply_artifacts, plan_deployment
+from clawake.services.gateway_config import (
+    ensure_control_ui_config,
+    ensure_plugin_runtime_config,
+    ensure_workspace_config,
+)
+from clawake.services.image_check import ImageCheckError, check_image_availability
+from clawake.services.plugins import sync_plugin
+from clawake.services.runtime_upgrade import (
+    doctor_command,
+    ensure_browser_cache,
+    is_browser_image,
+    run_doctor,
+    verify_runtime,
+    wait_for_health,
+)
 from clawake.services.systemd import CommandResult, SystemdService
+from clawake.services.upgrade import apply_upgrade, backup_config, build_upgrade_plan
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-app = typer.Typer(help="OpenClaw operations manager for rootless Podman + Quadlet")
+app = typer.Typer(
+    help="Deploy and operate OpenClaw teams. Changes are previewed unless --execute is set.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
 
 ConfigPath = Annotated[Path, typer.Option(..., "--config", "-c", exists=True, dir_okay=False)]
-OptionalMemberName = Annotated[str | None, typer.Option("--member", "-m")]
-ExecuteFlag = Annotated[bool, typer.Option("--execute")]
+OptionalMemberName = Annotated[
+    str | None, typer.Option("--member", "-m", help="Select one member; default: entire team.")
+]
+ExecuteFlag = Annotated[
+    bool, typer.Option("--execute", help="Apply the previewed operation to the local host.")
+]
 StatusFormat = Annotated[Literal["text", "json"], typer.Option("--format")]
 ShowTokenUrlFlag = Annotated[bool, typer.Option("--show-token-url")]
+TargetTag = Annotated[str, typer.Option(..., "--to", help="Target OpenClaw image tag")]
+TargetDigest = Annotated[str | None, typer.Option("--digest", help="Immutable target digest")]
 
 _ENV_LINE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
 
 def _load(path: Path) -> Inventory:
-    return load_inventory(path)
+    try:
+        return load_inventory(path)
+    except (ValueError, yaml.YAMLError, OSError) as exc:
+        raise typer.BadParameter(f"Cannot load {path}: {exc}", param_hint="--config") from exc
 
 
 def _template_root() -> Path:
@@ -40,7 +66,11 @@ def _instance_by_name(inventory: Inventory, name: str) -> InstanceSpec:
     for instance in inventory.instances:
         if instance.name == name:
             return instance
-    raise typer.BadParameter(f"Unknown member '{name}'")
+    raise typer.BadParameter(
+        f"Unknown member '{name}'. Available: "
+        + ", ".join(instance.name for instance in inventory.instances),
+        param_hint="--member",
+    )
 
 
 def _select_instances(inventory: Inventory, member: str | None) -> list[InstanceSpec]:
@@ -49,12 +79,89 @@ def _select_instances(inventory: Inventory, member: str | None) -> list[Instance
     return [_instance_by_name(inventory, member)]
 
 
+@app.command("sync-plugins")
+def sync_plugins(
+    config: ConfigPath,
+    member: OptionalMemberName = None,
+    execute: ExecuteFlag = False,
+) -> None:
+    """Verify and install integrity-pinned OpenClaw plugins from the inventory."""
+    inventory = _load(config)
+    selected = _select_instances(inventory, member)
+    declared = [(instance, plugin) for instance in selected for plugin in instance.plugins]
+    if not declared:
+        typer.echo("No managed plugins declared for the selected member(s).")
+        return
+
+    typer.echo(f"Plugin sync plan for {len(declared)} pinned plugin(s)")
+    plans = []
+    try:
+        for instance, plugin in declared:
+            result = sync_plugin(instance, plugin, execute=False)
+            plans.append((instance, plugin, result))
+            typer.echo(f" - {instance.name}: {plugin.id} ({result.digest})")
+            if plugin.source_type == "archive":
+                typer.echo(f"   mount: {plugin.artifact_path} -> {plugin.container_path}:ro")
+            else:
+                typer.echo(f"   npm: {plugin.npm_spec}")
+        for instance in selected:
+            for agent_id, tools in sorted(instance.agent_tool_allow.items()):
+                typer.echo(
+                    f" - {instance.name}: agent {agent_id} optional tools ({', '.join(tools)})"
+                )
+    except (OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+    if not execute:
+        typer.echo(
+            "DRY RUN sync-plugins complete. Run setup --execute first when an archive "
+            "mount is new or changed, then re-run with --execute."
+        )
+        return
+
+    service = SystemdService()
+    failed = False
+    restart_instances: dict[str, InstanceSpec] = {}
+    failed_instances: set[str] = set()
+    for instance, plugin, _result in plans:
+        try:
+            result = sync_plugin(instance, plugin, execute=True)
+            for command in result.commands:
+                typer.echo(f"$ {' '.join(command)}")
+            typer.echo(f"Installed verified plugin {plugin.id} on {instance.name}")
+            restart_instances[instance.name] = instance
+        except (OSError, RuntimeError, ValueError) as exc:
+            typer.echo(str(exc), err=True)
+            failed = True
+            failed_instances.add(instance.name)
+            continue
+    for instance in selected:
+        if instance.name in failed_instances:
+            continue
+        try:
+            config_path, config_changed = ensure_plugin_runtime_config(instance)
+            if config_changed:
+                typer.echo(f"Updated managed plugin config and agent ACLs in {config_path}")
+            restart_instances[instance.name] = instance
+        except (OSError, RuntimeError, ValueError) as exc:
+            typer.echo(str(exc), err=True)
+            failed = True
+            failed_instances.add(instance.name)
+    for instance in restart_instances.values():
+        restart_result = service.restart(instance.name, execute=True)
+        _print_result(restart_result)
+        failed = failed or restart_result.return_code != 0
+    if failed:
+        raise typer.Exit(code=1)
+
+
 def _print_result(result: CommandResult) -> None:
     typer.echo(f"$ {' '.join(result.command)}")
     if result.stdout:
         typer.echo(result.stdout)
     if result.stderr:
-        typer.echo(result.stderr)
+        typer.echo(result.stderr, err=True)
 
 
 def _status_state(result: CommandResult) -> str:
@@ -95,6 +202,49 @@ def _is_tolerated_teardown_error(result: CommandResult) -> bool:
     return any(marker in details for marker in tolerated_markers)
 
 
+def _retire_legacy_services(
+    service: SystemdService,
+    instances: list[InstanceSpec],
+    *,
+    disable: bool,
+    quadlet_roots: dict[str, Path] | None = None,
+) -> bool:
+    """Stop legacy units before a renamed instance claims their runtime resources."""
+    failed = False
+    for instance in instances:
+        for legacy_name in instance.legacy_names:
+            typer.echo(f"Retiring legacy service {legacy_name}.service for {instance.name}")
+            stop_result = service.stop(legacy_name, execute=True)
+            _print_result(stop_result)
+            if stop_result.return_code != 0 and not _is_tolerated_teardown_error(stop_result):
+                failed = True
+                continue
+
+            if disable:
+                disable_result = service.disable(legacy_name, execute=True)
+                _print_result(disable_result)
+                if disable_result.return_code != 0 and not _is_tolerated_teardown_error(
+                    disable_result
+                ):
+                    failed = True
+                    continue
+
+            if quadlet_roots is not None:
+                root = quadlet_roots[instance.host]
+                for artifact in (
+                    f"{legacy_name}.container",
+                    f"{legacy_name}.network",
+                    f"{legacy_name}-state.volume",
+                ):
+                    remove_result = service.remove_quadlet(str(root / artifact), execute=True)
+                    _print_result(remove_result)
+                    if remove_result.return_code != 0 and not _is_tolerated_teardown_error(
+                        remove_result
+                    ):
+                        failed = True
+    return not failed
+
+
 def _load_env_file_values(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists() or not path.is_file():
@@ -131,6 +281,137 @@ def _dashboard_host_url(instance: InstanceSpec) -> str:
     return f"http://127.0.0.1:{host_port}/"
 
 
+def _deploy_instance_assets(
+    instance: InstanceSpec,
+    inventory: Inventory,
+) -> list[Path]:
+    return apply_artifacts(plan_deployment(inventory, [instance], _template_root()))
+
+
+@app.command("upgrade")
+def upgrade_member(
+    config: ConfigPath,
+    member: Annotated[str, typer.Option(..., "--member", "-m")],
+    target_tag: TargetTag,
+    digest: TargetDigest = None,
+    execute: ExecuteFlag = False,
+) -> None:
+    """Safely upgrade one member, including backup, migration, and health checks."""
+    inventory = _load(config)
+    instance = _instance_by_name(inventory, member)
+    target_digest = digest
+    if target_digest is None and target_tag == instance.image.tag:
+        target_digest = instance.image.digest
+    if not target_digest:
+        raise typer.BadParameter(
+            "An immutable --digest is required when changing tags; "
+            "Clawake will not follow an unpinned image tag."
+        )
+
+    plan = build_upgrade_plan(config, member, target_tag, target_digest)
+    target = ImageSpec(
+        repository=instance.image.repository,
+        tag=plan.next_tag,
+        digest=plan.next_digest,
+    )
+    typer.echo(f"Upgrade plan for member '{member}':")
+    typer.echo(f"  image: {plan.previous_tag} -> {plan.next_tag}")
+    typer.echo(f"  digest: {plan.previous_digest or 'unpinned'} -> {plan.next_digest}")
+    typer.echo(f"  backup: {'yes' if instance.backup_policy.pre_mutation else 'no'}")
+    typer.echo(f"  migration: {' '.join(doctor_command(instance, target)[-5:])}")
+    typer.echo(f"  health: {_dashboard_host_url(instance).rstrip('/')}{instance.health.path}")
+    if not execute:
+        typer.echo("DRY RUN upgrade complete. Re-run with --execute to mutate state.")
+        return
+
+    service = SystemdService()
+    backup_dir = Path(".backups")
+    stopped = False
+    config_changed = False
+    runtime_backup: Path | None = None
+    config_backup: Path | None = None
+
+    try:
+        typer.echo("Verifying pinned image in registry...")
+        check_image_availability(target)
+
+        stop_result = service.stop(instance.name, execute=True)
+        _print_result(stop_result)
+        if stop_result.return_code != 0:
+            raise RuntimeError(stop_result.stderr or "failed to stop service")
+        stopped = True
+
+        if instance.backup_policy.enabled and instance.backup_policy.pre_mutation:
+            config_backup = backup_config(config, backup_dir)
+            runtime_backup = backup_instance(instance, backup_dir, execute=True)
+            typer.echo(f"Created config backup: {config_backup}")
+            typer.echo(f"Created runtime backup: {runtime_backup}")
+
+        if is_browser_image(target):
+            cache_path = ensure_browser_cache(instance)
+            typer.echo(f"Prepared private browser cache: {cache_path}")
+
+        typer.echo("Running OpenClaw safe migrations in a one-shot container...")
+        doctor_result = run_doctor(instance, target)
+        if doctor_result.returncode != 0:
+            details = doctor_result.stderr.strip() or doctor_result.stdout.strip()
+            raise RuntimeError(f"OpenClaw migration failed: {details}")
+
+        apply_upgrade(config, instance.name, target.tag, target.digest)
+        config_changed = True
+        updated_inventory = _load(config)
+        updated_instance = _instance_by_name(updated_inventory, member)
+        ensure_workspace_config(updated_instance)
+        ensure_control_ui_config(updated_instance)
+        for deployed in _deploy_instance_assets(updated_instance, updated_inventory):
+            typer.echo(f"Deployed {deployed}")
+
+        reload_result = service.daemon_reload(execute=True)
+        _print_result(reload_result)
+        if reload_result.return_code != 0:
+            raise RuntimeError(reload_result.stderr or "systemd daemon-reload failed")
+
+        restart_result = service.restart(instance.name, execute=True)
+        _print_result(restart_result)
+        if restart_result.return_code != 0:
+            raise RuntimeError(restart_result.stderr or "service restart failed")
+
+        healthy, health_details = wait_for_health(updated_instance)
+        if not healthy:
+            raise RuntimeError(f"health check failed: {health_details}")
+
+        runtime = verify_runtime(updated_instance, target)
+        if not runtime.healthy:
+            raise RuntimeError(f"runtime verification failed: {runtime.error}")
+
+        typer.echo(f"Upgrade complete: {runtime.version}")
+        typer.echo(f"Running image: {runtime.image_name}")
+        typer.echo(f"Health check: {health_details}")
+        if runtime_backup:
+            prune_backups(backup_dir, f"{instance.name}-", instance.backup_policy.retention)
+        if config_backup:
+            prune_backups(backup_dir, f"{config.stem}-", instance.backup_policy.retention)
+    except (ImageCheckError, OSError, RuntimeError, ValueError) as exc:
+        typer.echo(f"Upgrade failed: {exc}", err=True)
+        if stopped and not config_changed:
+            typer.echo("The config was not changed; attempting to restart the previous image.")
+            recovery = service.restart(instance.name, execute=True)
+            _print_result(recovery)
+        elif config_changed:
+            typer.echo("Stopping the failed upgraded service to prevent a restart loop.", err=True)
+            stopped_result = service.stop(instance.name, execute=True)
+            _print_result(stopped_result)
+        if runtime_backup:
+            typer.echo(f"Runtime recovery archive: {runtime_backup}", err=True)
+        if config_backup:
+            typer.echo(f"Config recovery file: {config_backup}", err=True)
+        typer.echo(
+            f"Inspect logs with: journalctl --user-unit {service.unit_name(instance.name)} -n 100",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+
 @app.command("onboard-member")
 def onboard_member(
     config: ConfigPath,
@@ -163,6 +444,10 @@ def onboard_member(
     onboard_result = subprocess.run(command, check=False)
     if onboard_result.returncode != 0:
         raise typer.Exit(code=onboard_result.returncode or 1)
+
+    workspace_config, workspace_changed = ensure_workspace_config(instance)
+    if workspace_changed:
+        typer.echo(f"Configured managed agent workspace in {workspace_config}")
 
     restart_result = SystemdService().restart(instance.name, execute=True)
     _print_result(restart_result)
@@ -241,36 +526,20 @@ def setup_quadlets(
         typer.echo("No matching members selected for setup")
         return
 
-    output = Path(".rendered")
-    output.mkdir(parents=True, exist_ok=True)
-    template_root = _template_root()
-    host_map = {host.name: host for host in inventory.hosts}
-    changed_artifacts: list[tuple[InstanceSpec, Path, Path]] = []
-    changed_instance_names: set[str] = set()
-
-    for instance in selected:
-        host = host_map[instance.host]
-        for relative_path, rendered_text in render_instance_assets(
-            instance,
-            template_root=template_root,
-        ).items():
-            rendered_file = output / relative_path
-            rendered_file.parent.mkdir(parents=True, exist_ok=True)
-            rendered_file.write_text(rendered_text, encoding="utf-8")
-
-            destination = Path(host.quadlet_root).expanduser() / relative_path
-            current_text = destination.read_text(encoding="utf-8") if destination.exists() else ""
-            if current_text != rendered_text:
-                changed_artifacts.append((instance, rendered_file, destination))
-                changed_instance_names.add(instance.name)
+    changed_artifacts = plan_deployment(inventory, selected, _template_root())
+    changed_instance_names = {change.member for change in changed_artifacts}
 
     typer.echo(
         f"Setup plan for cluster '{inventory.cluster.name}' ({inventory.cluster.mode}): "
         f"{len(changed_instance_names)}/{len(selected)} member(s) changed"
     )
 
-    for instance, rendered_file, destination in changed_artifacts:
-        typer.echo(f" - {instance.name} [{instance.role}] {rendered_file} -> {destination}")
+    for change in changed_artifacts:
+        typer.echo(f" - {change.member} [{change.role}] write {change.destination}")
+    typer.echo(
+        "  Apply: retire legacy services, prepare runtime config, reload systemd, "
+        "restart selected members."
+    )
 
     if not execute:
         typer.echo("DRY RUN setup-quadlets complete. Re-run with --execute to mutate state.")
@@ -279,22 +548,35 @@ def setup_quadlets(
     service = SystemdService()
     failed = False
 
+    quadlet_roots = {host.name: Path(host.quadlet_root).expanduser() for host in inventory.hosts}
+    if not _retire_legacy_services(
+        service,
+        selected,
+        disable=True,
+        quadlet_roots=quadlet_roots,
+    ):
+        raise typer.Exit(code=1)
+
     # Podman requires bind-mount sources to exist before starting the unit.
     for instance in selected:
         runtime_state = Path(instance.workspace_path).expanduser() / ".openclaw"
         runtime_state.mkdir(parents=True, exist_ok=True)
+        if is_browser_image(instance.image):
+            ensure_browser_cache(instance)
+        workspace_config, workspace_config_changed = ensure_workspace_config(instance)
+        if workspace_config_changed:
+            typer.echo(f"Configured managed agent workspace in {workspace_config}")
         gateway_config, gateway_config_changed = ensure_control_ui_config(instance)
         if gateway_config_changed:
             typer.echo(f"Updated local Control UI access in {gateway_config}")
 
-    for _instance, rendered_file, destination in changed_artifacts:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(rendered_file, destination)
-        typer.echo(f"Deployed {rendered_file} -> {destination}")
+    for destination in apply_artifacts(changed_artifacts):
+        typer.echo(f"Deployed {destination}")
 
     reload_result = service.daemon_reload(execute=True)
     _print_result(reload_result)
-    failed = failed or reload_result.return_code != 0
+    if reload_result.return_code != 0:
+        raise typer.Exit(code=1)
 
     if not changed_artifacts:
         typer.echo("No rendered changes detected; ensuring selected services are running.")
@@ -326,6 +608,8 @@ def restart_quadlets(
 
     service = SystemdService()
     failed = False
+    if execute and not _retire_legacy_services(service, selected, disable=False):
+        raise typer.Exit(code=1)
     for instance in selected:
         result = service.restart(instance.name, execute=execute)
         _print_result(result)
@@ -457,6 +741,44 @@ def teardown_quadlets(
 
     if failed:
         raise typer.Exit(code=1)
+
+
+@app.command("validate")
+def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) -> None:
+    """Validate inventory and render selected members without writes or runtime calls."""
+    inventory = _load(config)
+    selected = _select_instances(inventory, member)
+    changes = plan_deployment(inventory, selected, _template_root())
+    typer.echo(
+        f"Valid inventory: {inventory.cluster.name}; {len(selected)} member(s), "
+        f"{len(changes)} artifact change(s)."
+    )
+
+
+@app.command("logs")
+def member_logs(
+    config: ConfigPath,
+    member: Annotated[str, typer.Option(..., "--member", "-m")],
+    lines: Annotated[int, typer.Option("--lines", "-n", min=1, max=10000)] = 100,
+) -> None:
+    """Read the latest journal entries for one member."""
+    instance = _instance_by_name(_load(config), member)
+    result = SystemdService().logs(instance.name, lines=lines, execute=True)
+    if result.stdout:
+        typer.echo(result.stdout)
+    if result.stderr:
+        typer.echo(result.stderr, err=True)
+    if result.return_code:
+        raise typer.Exit(code=1)
+
+
+# Intent-oriented names; established commands remain compatible with scripts and Make.
+app.command("setup")(setup_quadlets)
+app.command("restart")(restart_quadlets)
+app.command("status")(status_quadlets)
+app.command("teardown")(teardown_quadlets)
+app.command("onboard")(onboard_member)
+app.command("dashboard")(diagnose_dashboard)
 
 
 if __name__ == "__main__":
