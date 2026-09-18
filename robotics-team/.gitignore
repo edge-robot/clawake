@@ -1,0 +1,18 @@
+env/
+
+# OpenClaw erzeugt in den Workspaces Laufzeitdaten, Gespräche und Zugangsdaten.
+workspaces/*/*
+!workspaces/*/AGENTS.md
+!workspaces/*/USER.md
+
+# Zusätzlicher Schutz für versehentlich verschachtelte Geheimnisse und Laufzeitdaten.
+workspaces/**/.openclaw/
+workspaces/**/memory/
+workspaces/**/credentials/
+workspaces/**/uploads/
+workspaces/**/attachments/
+workspaces/**/exports/
+workspaces/**/*.env
+workspaces/**/*.secret
+workspaces/**/*.key
+workspaces/**/*.pem

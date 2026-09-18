@@ -1,0 +1,166 @@
+version: 1
+cluster:
+  name: robotics-team
+  mode: single_host
+  primary_host: local
+  description: Drei KI-Agenten fuer Produktleitung, Robotikentwicklung und Partnerkoordination
+hosts:
+  - name: local
+    quadlet_root: ~/.config/containers/systemd
+networks:
+  - name: robotics-coordination
+    host: local
+instances:
+  - name: robotics-product-owner
+    host: local
+    role: product_owner
+    workspace_path: ${CLAWAKE_PROJECT_ROOT}/robotics-team/workspaces/product-owner
+    team_definition_path: ${CLAWAKE_PROJECT_ROOT}/robotics-team/roles/product-owner
+    quadlet_path: robotics-product-owner.container
+    container_name: robotics-product-owner
+    networks: [robotics-coordination]
+    openclaw:
+      lead_agent_id: main
+      subagents:
+        max_spawn_depth: 1
+        max_children_per_agent: 3
+        max_concurrent: 3
+        run_timeout_seconds: 900
+      a2a:
+        enabled: true
+        peers:
+          engineering:
+            instance: robotics-engineer
+            inbound_token_env: A2A_ENGINEERING_TO_PRODUCT
+            outbound_token_env: A2A_PRODUCT_TO_ENGINEERING
+          partnerships:
+            instance: project-partner-manager
+            inbound_token_env: A2A_PARTNERSHIPS_TO_PRODUCT
+            outbound_token_env: A2A_PRODUCT_TO_PARTNERSHIPS
+    image:
+      repository: ghcr.io/openclaw/openclaw
+      tag: "2026.9.4-browser"
+      digest: sha256:0862ab9a097166049800a6c86026b035b768af0949f651d0e73222555b28fbbd
+    ports:
+      - bind_address: 127.0.0.1
+        host_port: 19089
+        container_port: 18789
+        protocol: tcp
+    env_files:
+      - ${CLAWAKE_PROJECT_ROOT}/robotics-team/env/product-owner.env
+    labels:
+      env: robotics
+      audience: internal
+      responsibility: product-and-technical-leadership
+    gateway_runtime:
+      enabled: true
+      bind: lan
+    backup_policy:
+      enabled: true
+      pre_mutation: true
+      retention: 3
+    dashboard:
+      friendly_name: Product and Systems Director
+      owner: Robotics Team
+      description: Produktverantwortung und technische Gesamtleitung
+      tags: [robotics, product-owner, technical-lead]
+
+  - name: robotics-engineer
+    host: local
+    role: developer
+    workspace_path: ${CLAWAKE_PROJECT_ROOT}/robotics-team/workspaces/robotics-engineer
+    team_definition_path: ${CLAWAKE_PROJECT_ROOT}/robotics-team/roles/robotics-engineer
+    quadlet_path: robotics-engineer.container
+    container_name: robotics-engineer
+    networks: [robotics-coordination]
+    openclaw:
+      lead_agent_id: main
+      subagents:
+        max_spawn_depth: 1
+        max_children_per_agent: 3
+        max_concurrent: 3
+        run_timeout_seconds: 900
+      a2a:
+        enabled: true
+        peers:
+          product:
+            instance: robotics-product-owner
+            inbound_token_env: A2A_PRODUCT_TO_ENGINEERING
+            outbound_token_env: A2A_ENGINEERING_TO_PRODUCT
+    image:
+      repository: ghcr.io/openclaw/openclaw
+      tag: "2026.9.4"
+      digest: sha256:cc596b846506a5f4cfcee111394a2725f375f01cca2ebb492a161fd1b747f101
+    ports:
+      - bind_address: 127.0.0.1
+        host_port: 19189
+        container_port: 18789
+        protocol: tcp
+    env_files:
+      - ${CLAWAKE_PROJECT_ROOT}/robotics-team/env/robotics-engineer.env
+    labels:
+      env: robotics
+      audience: internal
+      responsibility: hardware-software-integration
+    gateway_runtime:
+      enabled: true
+      bind: lan
+    backup_policy:
+      enabled: true
+      pre_mutation: true
+      retention: 3
+    dashboard:
+      friendly_name: Engineering Director
+      owner: Robotics Team
+      description: Hardware, Software, Integration und technische Qualitaet
+      tags: [robotics, hardware, software, integration]
+
+  - name: project-partner-manager
+    host: local
+    role: product_owner
+    workspace_path: ${CLAWAKE_PROJECT_ROOT}/robotics-team/workspaces/project-partner-manager
+    team_definition_path: ${CLAWAKE_PROJECT_ROOT}/robotics-team/roles/project-partner-manager
+    quadlet_path: project-partner-manager.container
+    container_name: project-partner-manager
+    networks: [robotics-coordination]
+    openclaw:
+      lead_agent_id: main
+      subagents:
+        max_spawn_depth: 1
+        max_children_per_agent: 3
+        max_concurrent: 3
+        run_timeout_seconds: 900
+      a2a:
+        enabled: true
+        peers:
+          product:
+            instance: robotics-product-owner
+            inbound_token_env: A2A_PRODUCT_TO_PARTNERSHIPS
+            outbound_token_env: A2A_PARTNERSHIPS_TO_PRODUCT
+    image:
+      repository: ghcr.io/openclaw/openclaw
+      tag: "2026.9.4-browser"
+      digest: sha256:0862ab9a097166049800a6c86026b035b768af0949f651d0e73222555b28fbbd
+    ports:
+      - bind_address: 127.0.0.1
+        host_port: 19289
+        container_port: 18789
+        protocol: tcp
+    env_files:
+      - ${CLAWAKE_PROJECT_ROOT}/robotics-team/env/project-partner-manager.env
+    labels:
+      env: robotics
+      audience: internal
+      responsibility: project-customer-supplier-coordination
+    gateway_runtime:
+      enabled: true
+      bind: lan
+    backup_policy:
+      enabled: true
+      pre_mutation: true
+      retention: 3
+    dashboard:
+      friendly_name: Program and Partnerships Director
+      owner: Robotics Team
+      description: Projektsteuerung sowie Kunden- und Lieferantenkoordination
+      tags: [robotics, project-management, customers, suppliers]

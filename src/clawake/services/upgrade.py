@@ -43,34 +43,34 @@ def _format_image_value(key: str, value: str) -> str:
 
 def _update_image_fields(config_path: Path, instance_name: str, updates: dict[str, str]) -> None:
     """Update one image mapping without reformatting the rest of the YAML document."""
-    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    instance_pattern = re.compile(r"^(\s*)-\s+name:\s*" + re.escape(instance_name) + r"\s*$")
-    instance_start = next(
-        (index for index, line in enumerate(lines) if instance_pattern.match(line.rstrip("\n"))),
-        None,
-    )
-    if instance_start is None:
+    raw = config_path.read_text(encoding="utf-8")
+    lines = raw.splitlines(keepends=True)
+    document = yaml.compose(raw)
+    instances = next(value for key, value in document.value if key.value == "instances")
+    selected = next((node for node in instances.value if any(
+        key.value == "name" and value.value == instance_name for key, value in node.value
+    )), None)
+    if selected is None:
         raise ValueError(f"Unknown instance '{instance_name}'")
-
-    instance_indent = len(lines[instance_start]) - len(lines[instance_start].lstrip())
-    instance_end = len(lines)
-    for index in range(instance_start + 1, len(lines)):
-        stripped = lines[index].lstrip()
-        indent = len(lines[index]) - len(stripped)
-        if indent == instance_indent and stripped.startswith("- name:"):
-            instance_end = index
-            break
-
-    image_index = next(
-        (
-            index
-            for index in range(instance_start + 1, instance_end)
-            if lines[index].strip() == "image:"
-        ),
-        None,
-    )
-    if image_index is None:
+    image_pair = next(((key, value) for key, value in selected.value if key.value == "image"), None)
+    if image_pair is None:
         raise ValueError(f"Instance '{instance_name}' does not define image")
+    image_key, image_node = image_pair
+    # Editing an alias would also modify another instance's image.
+    if any(value is image_node for node in instances.value if node is not selected
+           for key, value in node.value if key.value == "image"):
+        raise ValueError("Shared YAML image aliases must be expanded before upgrade")
+    if image_node.flow_style:
+        image = dict(_find_instance(yaml.safe_load(raw), instance_name)["image"])
+        image.update(updates)
+        replacement = yaml.safe_dump(image, default_flow_style=True, sort_keys=False).strip()
+        config_path.write_text(
+            raw[:image_node.start_mark.index] + replacement + raw[image_node.end_mark.index:],
+            encoding="utf-8",
+        )
+        return
+    image_index = image_key.start_mark.line
+    instance_end = selected.end_mark.line
 
     image_indent = len(lines[image_index]) - len(lines[image_index].lstrip())
     child_indent = image_indent + 2

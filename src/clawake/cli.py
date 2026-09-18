@@ -11,11 +11,9 @@ import yaml
 
 from clawake.config import ImageSpec, InstanceSpec, Inventory, load_inventory
 from clawake.services.backup import backup_instance, prune_backups
-from clawake.services.deployment import apply_artifacts, plan_deployment
+from clawake.services.deployment import ArtifactChange, apply_artifacts, plan_deployment
 from clawake.services.gateway_config import (
-    ensure_control_ui_config,
     ensure_plugin_runtime_config,
-    ensure_workspace_config,
 )
 from clawake.services.image_check import ImageCheckError, check_image_availability
 from clawake.services.plugins import sync_plugin
@@ -288,6 +286,39 @@ def _deploy_instance_assets(
     return apply_artifacts(plan_deployment(inventory, [instance], _template_root()))
 
 
+def _print_plan(changes: list[ArtifactChange]) -> None:
+    for change in changes:
+        typer.echo(
+            f" - {change.member} [{change.role}] {change.kind}: write {change.destination}"
+        )
+        if change.changed_keys:
+            typer.echo(f"   changed keys: {', '.join(change.changed_keys)}")
+
+
+def _check_a2a_environment(instances: list[InstanceSpec], inventory: Inventory) -> None:
+    """Check configured environment files before writes; never disclose values."""
+    environments = {item.name: _instance_env_values(item) for item in inventory.instances}
+    for instance in instances:
+        if not instance.openclaw or not instance.openclaw.a2a.enabled:
+            continue
+        values = environments[instance.name]
+        required = {"OPENCLAW_GATEWAY_TOKEN"}
+        for peer in instance.openclaw.a2a.peers.values():
+            required.update([peer.inbound_token_env, peer.outbound_token_env])
+        missing = sorted(key for key in required if not values.get(key))
+        if missing:
+            raise typer.BadParameter(
+                f"Missing environment values for {instance.name}: {', '.join(missing)}"
+            )
+        for peer in instance.openclaw.a2a.peers.values():
+            remote_values = environments[peer.instance]
+            for key in (peer.inbound_token_env, peer.outbound_token_env):
+                if remote_values.get(key) and values[key] != remote_values[key]:
+                    raise typer.BadParameter(
+                        f"A2A token mismatch for {key}: {instance.name}, {peer.instance}"
+                    )
+
+
 @app.command("upgrade")
 def upgrade_member(
     config: ConfigPath,
@@ -314,15 +345,22 @@ def upgrade_member(
         tag=plan.next_tag,
         digest=plan.next_digest,
     )
+    target_inventory = inventory.model_copy(deep=True)
+    target_instance = _instance_by_name(target_inventory, member)
+    target_instance.image = target
+    changes = plan_deployment(target_inventory, [target_instance], _template_root())
     typer.echo(f"Upgrade plan for member '{member}':")
     typer.echo(f"  image: {plan.previous_tag} -> {plan.next_tag}")
     typer.echo(f"  digest: {plan.previous_digest or 'unpinned'} -> {plan.next_digest}")
     typer.echo(f"  backup: {'yes' if instance.backup_policy.pre_mutation else 'no'}")
     typer.echo(f"  migration: {' '.join(doctor_command(instance, target)[-5:])}")
     typer.echo(f"  health: {_dashboard_host_url(instance).rstrip('/')}{instance.health.path}")
+    _print_plan(changes)
     if not execute:
         typer.echo("DRY RUN upgrade complete. Re-run with --execute to mutate state.")
         return
+
+    _check_a2a_environment([instance], inventory)
 
     service = SystemdService()
     backup_dir = Path(".backups")
@@ -361,8 +399,7 @@ def upgrade_member(
         config_changed = True
         updated_inventory = _load(config)
         updated_instance = _instance_by_name(updated_inventory, member)
-        ensure_workspace_config(updated_instance)
-        ensure_control_ui_config(updated_instance)
+        # Doctor may have migrated the configuration. Recompute the same plan against it.
         for deployed in _deploy_instance_assets(updated_instance, updated_inventory):
             typer.echo(f"Deployed {deployed}")
 
@@ -441,13 +478,19 @@ def onboard_member(
         typer.echo("DRY RUN onboard-member complete. Re-run with --execute to open the TUI.")
         return
 
+    _check_a2a_environment([instance], inventory)
+
     onboard_result = subprocess.run(command, check=False)
     if onboard_result.returncode != 0:
         raise typer.Exit(code=onboard_result.returncode or 1)
 
-    workspace_config, workspace_changed = ensure_workspace_config(instance)
-    if workspace_changed:
-        typer.echo(f"Configured managed agent workspace in {workspace_config}")
+    changes = plan_deployment(inventory, [instance], _template_root())
+    _print_plan(changes)
+    apply_artifacts(changes)
+    reload_result = SystemdService().daemon_reload(execute=True)
+    _print_result(reload_result)
+    if reload_result.return_code != 0:
+        raise typer.Exit(code=1)
 
     restart_result = SystemdService().restart(instance.name, execute=True)
     _print_result(restart_result)
@@ -527,15 +570,16 @@ def setup_quadlets(
         return
 
     changed_artifacts = plan_deployment(inventory, selected, _template_root())
-    changed_instance_names = {change.member for change in changed_artifacts}
+    changed_instance_names = {
+        change.member for change in changed_artifacts if change.role != "shared_network"
+    }
 
     typer.echo(
         f"Setup plan for cluster '{inventory.cluster.name}' ({inventory.cluster.mode}): "
         f"{len(changed_instance_names)}/{len(selected)} member(s) changed"
     )
 
-    for change in changed_artifacts:
-        typer.echo(f" - {change.member} [{change.role}] write {change.destination}")
+    _print_plan(changed_artifacts)
     typer.echo(
         "  Apply: retire legacy services, prepare runtime config, reload systemd, "
         "restart selected members."
@@ -547,6 +591,8 @@ def setup_quadlets(
 
     service = SystemdService()
     failed = False
+
+    _check_a2a_environment(selected, inventory)
 
     quadlet_roots = {host.name: Path(host.quadlet_root).expanduser() for host in inventory.hosts}
     if not _retire_legacy_services(
@@ -563,12 +609,6 @@ def setup_quadlets(
         runtime_state.mkdir(parents=True, exist_ok=True)
         if is_browser_image(instance.image):
             ensure_browser_cache(instance)
-        workspace_config, workspace_config_changed = ensure_workspace_config(instance)
-        if workspace_config_changed:
-            typer.echo(f"Configured managed agent workspace in {workspace_config}")
-        gateway_config, gateway_config_changed = ensure_control_ui_config(instance)
-        if gateway_config_changed:
-            typer.echo(f"Updated local Control UI access in {gateway_config}")
 
     for destination in apply_artifacts(changed_artifacts):
         typer.echo(f"Deployed {destination}")
@@ -729,6 +769,22 @@ def teardown_quadlets(
             _print_result(result)
             if result.return_code != 0 and not _is_tolerated_teardown_error(result):
                 failed = True
+
+    # Shared resources belong to the inventory, never to a single member.
+    selected_names = {chosen.name for chosen in selected}
+    for network in inventory.networks:
+        owners = {item.name for item in inventory.instances if network.name in item.networks}
+        if failed or not owners or not owners.issubset(selected_names):
+            continue
+        result = service.stop(f"{network.name}-network", execute=execute)
+        _print_result(result)
+        if result.return_code != 0 and not _is_tolerated_teardown_error(result):
+            failed = True
+            continue
+        target = Path(host_map[network.host].quadlet_root).expanduser() / network.quadlet_path
+        result = service.remove_quadlet(str(target), execute=execute)
+        _print_result(result)
+        failed = failed or result.return_code != 0
 
     reload_result = service.daemon_reload(execute=execute)
     _print_result(reload_result)

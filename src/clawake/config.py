@@ -8,7 +8,22 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
+from pydantic import BaseModel as PydanticBaseModel
+from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
+
+
+class BaseModel(PydanticBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+def bind_addresses_overlap(first: str, second: str) -> bool:
+    """Conservatively reserve IPv6 wildcard for dual-stack listeners too."""
+    a, b = ip_address(first), ip_address(second)
+    a = getattr(a, "ipv4_mapped", None) or a
+    b = getattr(b, "ipv4_mapped", None) or b
+    return a == b or str(a) == "::" or str(b) == "::" or (
+        a.version == b.version and (a.is_unspecified or b.is_unspecified)
+    )
 
 
 def _project_root_from_environment(default: str = "") -> str:
@@ -31,6 +46,15 @@ class HostSpec(BaseModel):
     ssh_target: str | None = None
 
 
+class NetworkSpec(BaseModel):
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
+    host: str
+
+    @property
+    def quadlet_path(self) -> str:
+        return f"{self.name}.network"
+
+
 class ImageSpec(BaseModel):
     repository: str
     tag: str
@@ -44,6 +68,11 @@ class PortSpec(BaseModel):
     host_port: int = Field(ge=1, le=65535)
     container_port: int = Field(ge=1, le=65535)
     protocol: Literal["tcp", "udp"] = "tcp"
+
+    @field_validator("bind_address")
+    @classmethod
+    def normalize_address(cls, value: str) -> str:
+        return str(ip_address(value))
 
 
 class MountSpec(BaseModel):
@@ -125,7 +154,7 @@ class GatewayRuntimeSpec(BaseModel):
     enabled: bool = False
     bind: Literal["loopback", "lan", "tailnet", "auto", "custom"] = "lan"
     gateway_container_port: int = Field(default=18789, ge=1, le=65535)
-    bridge_container_port: int = Field(default=18790, ge=1, le=65535)
+    bridge_container_port: int | None = Field(default=None, ge=1, le=65535)
 
 
 class DashboardMeta(BaseModel):
@@ -133,6 +162,37 @@ class DashboardMeta(BaseModel):
     owner: str | None = None
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
+
+
+class SubagentSpec(BaseModel):
+    max_spawn_depth: int = Field(default=1, ge=1, le=5)
+    max_children_per_agent: int = Field(default=3, ge=1, le=20)
+    max_concurrent: int = Field(default=3, ge=1)
+    run_timeout_seconds: int = Field(default=900, ge=1)
+
+
+class PeerSpec(BaseModel):
+    instance: str
+    inbound_token_env: str = Field(pattern=r"^[A-Z_][A-Z0-9_]*$")
+    outbound_token_env: str = Field(pattern=r"^[A-Z_][A-Z0-9_]*$")
+
+
+class A2ASpec(BaseModel):
+    enabled: bool = False
+    peers: dict[str, PeerSpec] = Field(default_factory=dict)
+
+    @field_validator("peers")
+    @classmethod
+    def validate_peer_names(cls, value: dict[str, PeerSpec]) -> dict[str, PeerSpec]:
+        if any(not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", key) for key in value):
+            raise ValueError("Invalid A2A peer name")
+        return value
+
+
+class OpenClawSpec(BaseModel):
+    lead_agent_id: str = Field(default="main", pattern=r"^[a-z][a-z0-9_-]*$")
+    subagents: SubagentSpec | None = None
+    a2a: A2ASpec = Field(default_factory=A2ASpec)
 
 
 class InstanceSpec(BaseModel):
@@ -147,6 +207,8 @@ class InstanceSpec(BaseModel):
     container_name: str
     image: ImageSpec
     ports: list[PortSpec] = Field(default_factory=list)
+    networks: list[str] = Field(default_factory=list)
+    openclaw: OpenClawSpec | None = None
     mounts: list[MountSpec] = Field(default_factory=list)
     plugins: list[PluginSpec] = Field(default_factory=list)
     agent_tool_allow: dict[str, list[str]] = Field(default_factory=dict)
@@ -226,16 +288,17 @@ class InstanceSpec(BaseModel):
     def quadlet_artifact_paths(self) -> list[str]:
         return [
             self.quadlet_path,
-            self.network_quadlet_path,
+            *([] if self.networks else [self.network_quadlet_path]),
             self.runtime_volume_quadlet_path,
         ]
 
 
 class Inventory(BaseModel):
-    version: int = 1
+    version: Literal[1] = 1
     cluster: ClusterSpec
     hosts: list[HostSpec]
     instances: list[InstanceSpec]
+    networks: list[NetworkSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_inventory(self) -> Inventory:
@@ -272,6 +335,16 @@ class Inventory(BaseModel):
             )
 
         instance_names: set[str] = set()
+        network_map = {network.name: network for network in self.networks}
+        if len(network_map) != len(self.networks):
+            raise ValueError("Duplicate network names")
+        for network in self.networks:
+            if network.host not in host_names:
+                raise ValueError(f"Unknown network host: {network.host}")
+        container_names: set[tuple[str, str]] = set()
+        artifact_paths = {
+            (network.host, network.quadlet_path) for network in self.networks
+        }
         used_ports: dict[tuple[str, str, int, str], str] = {}
         used_paths: dict[str, tuple[str, str]] = {}
 
@@ -283,6 +356,26 @@ class Inventory(BaseModel):
             if instance.name in instance_names:
                 raise ValueError(f"Duplicate instance name '{instance.name}'")
             instance_names.add(instance.name)
+            container_key = (instance.host, instance.container_name)
+            if container_key in container_names:
+                raise ValueError(f"Duplicate container name: {instance.container_name}")
+            container_names.add(container_key)
+            if not instance.networks and instance.container_name in network_map:
+                raise ValueError(
+                    f"Private/shared Podman network collision: {instance.container_name}"
+                )
+            if instance.name in {f"{name}-network" for name in network_map}:
+                raise ValueError(f"Shared network service collision: {instance.name}")
+            if len(set(instance.networks)) != len(instance.networks):
+                raise ValueError(f"Duplicate network membership: {instance.name}")
+            for name in instance.networks:
+                if name not in network_map or network_map[name].host != instance.host:
+                    raise ValueError(f"Unknown or cross-host network: {name}")
+            for path in instance.quadlet_artifact_paths:
+                key = (instance.host, path)
+                if key in artifact_paths:
+                    raise ValueError(f"Quadlet artifact collision: {path}")
+                artifact_paths.add(key)
 
             _validate_safe_absolute_path(
                 f"instances[{instance.name}].workspace_path",
@@ -326,11 +419,10 @@ class Inventory(BaseModel):
                         raise ValueError(f"Plugin artifact for '{plugin.id}' must end with '.tgz'")
 
             if instance.gateway_runtime.enabled:
-                expected = {
-                    instance.gateway_runtime.gateway_container_port,
-                    instance.gateway_runtime.bridge_container_port,
-                }
-                actual = {port.container_port for port in instance.ports}
+                expected = {instance.gateway_runtime.gateway_container_port}
+                if instance.gateway_runtime.bridge_container_port is not None:
+                    expected.add(instance.gateway_runtime.bridge_container_port)
+                actual = {port.container_port for port in instance.ports if port.protocol == "tcp"}
                 if not expected.issubset(actual):
                     raise ValueError(
                         f"Instance '{instance.name}' enables gateway_runtime but is missing "
@@ -339,12 +431,17 @@ class Inventory(BaseModel):
 
             for port in instance.ports:
                 port_key = (instance.host, port.bind_address, port.host_port, port.protocol)
-                if port_key in used_ports:
-                    raise ValueError(
-                        f"Port collision on host {instance.host} "
-                        f"{port.bind_address}:{port.host_port} "
-                        f"between {used_ports[port_key]} and {instance.name}"
-                    )
+                for (host, address, number, protocol), owner in used_ports.items():
+                    if (
+                        host == instance.host and number == port.host_port
+                        and protocol == port.protocol
+                        and bind_addresses_overlap(address, port.bind_address)
+                    ):
+                        raise ValueError(
+                            f"Port collision on host {instance.host} "
+                            f"{port.bind_address}:{port.host_port} "
+                            f"between {owner} and {instance.name}"
+                        )
                 used_ports[port_key] = instance.name
 
             storage_paths = {
@@ -361,6 +458,41 @@ class Inventory(BaseModel):
                     )
                 used_paths[normalized] = (instance.name, boundary)
 
+        instance_map = {instance.name: instance for instance in self.instances}
+        for instance in self.instances:
+            settings = instance.openclaw
+            if settings is None:
+                continue
+            if settings.a2a.peers and not settings.a2a.enabled:
+                raise ValueError(f"A2A peers require enabled A2A: {instance.name}")
+            inbound_refs = [p.inbound_token_env for p in settings.a2a.peers.values()]
+            if len(set(inbound_refs)) != len(inbound_refs):
+                raise ValueError(f"A2A inbound tokens must be unique per peer: {instance.name}")
+            if settings.a2a.enabled and (
+                not instance.gateway_runtime.enabled or instance.gateway_runtime.bind != "lan"
+            ):
+                raise ValueError(f"A2A requires a managed gateway with bind=lan: {instance.name}")
+            targets: set[str] = set()
+            for peer in settings.a2a.peers.values():
+                target = instance_map.get(peer.instance)
+                if target is None or target is instance or target.name in targets:
+                    raise ValueError(f"Unknown, duplicate or self A2A target: {peer.instance}")
+                targets.add(target.name)
+                if not set(instance.networks).intersection(target.networks):
+                    raise ValueError(
+                        f"A2A peers need a shared network: {instance.name}, {target.name}"
+                    )
+                if target.openclaw is None or not target.openclaw.a2a.enabled:
+                    raise ValueError(f"A2A target is not enabled: {target.name}")
+                reverse = next((p for p in target.openclaw.a2a.peers.values()
+                                if p.instance == instance.name), None)
+                if reverse is None or (
+                    reverse.inbound_token_env != peer.outbound_token_env
+                    or reverse.outbound_token_env != peer.inbound_token_env
+                ):
+                    raise ValueError(
+                        f"A2A peers require reciprocal token references: {target.name}"
+                    )
         return self
 
 

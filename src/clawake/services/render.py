@@ -4,7 +4,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from clawake.config import InstanceSpec, Inventory
+from clawake.config import InstanceSpec, Inventory, NetworkSpec
 from clawake.services.runtime_upgrade import browser_cache_path, is_browser_image
 
 
@@ -39,9 +39,10 @@ def render_instance_assets(instance: InstanceSpec, template_root: Path) -> dict[
     }
     templates = {
         instance.quadlet_path: "quadlet/openclaw.container.j2",
-        instance.network_quadlet_path: "quadlet/openclaw.network.j2",
         instance.runtime_volume_quadlet_path: "quadlet/openclaw.volume.j2",
     }
+    if not instance.networks:
+        templates[instance.network_quadlet_path] = "quadlet/openclaw.network.j2"
     rendered: dict[str, str] = {}
     for target_path, template_name in templates.items():
         template = env.get_template(template_name)
@@ -49,9 +50,21 @@ def render_instance_assets(instance: InstanceSpec, template_root: Path) -> dict[
     return rendered
 
 
+def render_shared_network(network: NetworkSpec) -> str:
+    return (
+        f"[Unit]\nDescription=Clawake shared network {network.name}\n\n"
+        f"[Network]\nNetworkName={network.name}\nNetworkDeleteOnStop=true\n"
+    )
+
+
 def render_inventory(inventory: Inventory, output_dir: Path, template_root: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered_paths: list[Path] = []
+    for network in inventory.networks:
+        target = output_dir / network.quadlet_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(render_shared_network(network), encoding="utf-8")
+        rendered_paths.append(target)
     for instance in inventory.instances:
         assets = render_instance_assets(instance, template_root=template_root)
         for relative_path, content in assets.items():

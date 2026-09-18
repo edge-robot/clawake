@@ -13,7 +13,8 @@ runtime state. Clawake has no background controller or independent scheduler.
 | --- | --- | --- |
 | `config.py` | Inventory schema, expansion and structural validation | Reads inventory |
 | `services/render.py` | Deterministic Quadlet generation | Rendering is in memory; explicit export helper writes files |
-| `services/deployment.py` | Typed artifact changes, desired/installed comparison, explicit apply | Planning reads installed files; applying writes changed files |
+| `services/deployment.py` | Unified Quadlet and runtime file plan, desired/installed comparison, explicit apply | Planning reads installed files; applying atomically replaces each changed file |
+| `services/runtime_config.py` | Desired OpenClaw settings and managed-field ownership | Pure planning from inventory and persisted configuration |
 | `services/systemd.py` | systemd, journal and container command adapter | Commands execute only when requested |
 | `services/gateway_config.py` | Managed workspace and local dashboard configuration | Updates OpenClaw configuration |
 | `services/backup.py`, `upgrade.py`, `runtime_upgrade.py`, `image_check.py` | Upgrade planning, backups, migration and verification | Filesystem, registry and runtime operations |
@@ -36,7 +37,45 @@ directory. Applying writes directly to configured Quadlet destinations.
 Setup converges artifact contents but deliberately restarts even unchanged members
 to reconcile stopped services. It is not a continuous reconciliation loop. File
 application is not transactional: a filesystem failure can leave partial changes.
-A subsequent setup can recompute the remaining differences.
+A subsequent setup can recompute the remaining differences. Before any file replacement,
+application checks that all planned files still match their observed contents. Runtime
+files use mode 0600. Plans and CLI output expose changed key names, never config values.
+
+Setup and upgrade plan both Quadlets and OpenClaw runtime configuration. Upgrade previews
+the target image without changing inventory and replans after Doctor migrations. Onboarding
+also reapplies this plan before restarting. Plugin installation remains an explicit
+`sync-plugins` action; the bundled A2A channel needs no package installation.
+
+## Shared networks and leadership teams
+
+Optional inventory-level `networks` define host-scoped, named Quadlet networks.
+`instances[].networks` references these networks; an omitted list retains the existing
+private-network behavior. Shared networks are rendered once, including for member-scoped
+setup. Teardown preserves them while unselected inventory members reference them. Once all
+referencing members are selected and successfully stopped, teardown stops the network
+unit and removes its definition. `NetworkDeleteOnStop=true` removes the Podman network.
+Network definitions removed from the inventory are not garbage-collected automatically;
+teardown must run with the old inventory before retiring a shared network.
+
+Host port validation rejects overlaps for the same host/protocol/port, including wildcard
+IPv4, conservative dual-stack IPv6 and IPv4-mapped addresses. Repeated container ports are
+valid in separate container network namespaces. Bind addresses must be literal IPs.
+Validation does not discover other inventories or live host listeners.
+
+Optional `instances[].openclaw` defines one `lead_agent_id`, bounded `subagents`, and
+`a2a.peers`. Subagent limits apply per Gateway, not team-wide. Peers reference inventory
+members on a shared network and reciprocal inbound/outbound environment variable names.
+Clawake derives peer URLs from container names and Gateway ports, writes literal OpenClaw
+environment references, enables bundled A2A, and binds A2A ingress to the lead agent.
+Separate instances communicate through A2A; temporary subagents remain OpenClaw sessions.
+
+The managed runtime ledger records only Clawake-owned generated fields and routing
+bindings. Unmanaged models, channels and settings survive reconciliation. A differing
+unmanaged field causes a conflict on first adoption; removed owned fields are deleted,
+and operator edits to removed fields require explicit resolution. Existing plugin
+allowlists must already admit A2A. Peer changes should be applied to both endpoints.
+Schema version 1 remains supported; unknown structural fields and unsupported versions
+are now rejected instead of silently discarded. Plugin-specific `config` remains open.
 
 Upgrade verifies the target image before stopping the service, backs up according
 to policy, runs migrations, updates inventory and deploys the new artifacts. It

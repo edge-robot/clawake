@@ -57,43 +57,58 @@ def ensure_workspace_config(instance: InstanceSpec) -> tuple[Path, bool]:
     config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
     payload = _load_config(config_path)
 
+    changed = configure_workspace(payload)
+    if changed:
+        _write_config(config_path, payload)
+    return config_path, changed
+
+
+def configure_workspace(payload: dict[str, object]) -> bool:
+    """Merge workspace defaults in memory for preview and application."""
+
     agents = payload.setdefault("agents", {})
     if not isinstance(agents, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': agents must be an object")
+        raise ValueError("OpenClaw config: agents must be an object")
     defaults = agents.setdefault("defaults", {})
     if not isinstance(defaults, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': agents.defaults must be an object")
+        raise ValueError("OpenClaw config: agents.defaults must be an object")
 
     if defaults.get("workspace") == _MANAGED_WORKSPACE:
-        return config_path, False
+        return False
 
     defaults["workspace"] = _MANAGED_WORKSPACE
-    _write_config(config_path, payload)
-    return config_path, True
+    return True
 
 
 def ensure_control_ui_config(instance: InstanceSpec) -> tuple[Path, bool]:
     """Merge inferred local Control UI settings into OpenClaw's persisted config."""
     config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
+    payload = _load_config(config_path)
+    changed = configure_control_ui(instance, payload)
+    if changed:
+        _write_config(config_path, payload)
+    return config_path, changed
+
+
+def configure_control_ui(instance: InstanceSpec, payload: dict[str, object]) -> bool:
+    """Merge dashboard defaults without filesystem side effects."""
     origins = local_control_ui_origins(instance)
     if not instance.gateway_runtime.enabled or not origins:
-        return config_path, False
-
-    payload = _load_config(config_path)
+        return False
 
     gateway = payload.setdefault("gateway", {})
     if not isinstance(gateway, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': gateway must be an object")
+        raise ValueError("OpenClaw config: gateway must be an object")
     control_ui = gateway.setdefault("controlUi", {})
     if not isinstance(control_ui, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': gateway.controlUi must be an object")
+        raise ValueError("OpenClaw config: gateway.controlUi must be an object")
 
     existing_origins = control_ui.get("allowedOrigins", [])
     if not isinstance(existing_origins, list) or not all(
         isinstance(origin, str) for origin in existing_origins
     ):
         raise ValueError(
-            f"OpenClaw config '{config_path}': gateway.controlUi.allowedOrigins "
+            "OpenClaw config: gateway.controlUi.allowedOrigins "
             "must be a string array"
         )
 
@@ -118,11 +133,7 @@ def ensure_control_ui_config(instance: InstanceSpec) -> tuple[Path, bool]:
         control_ui["allowInsecureAuth"] = True
         changed = True
 
-    if not changed:
-        return config_path, False
-
-    _write_config(config_path, payload)
-    return config_path, True
+    return changed
 
 
 def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
