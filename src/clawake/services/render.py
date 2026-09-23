@@ -5,6 +5,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from clawake.config import InstanceSpec, Inventory, NetworkSpec
+from clawake.inventory_validation import require_v1_runtime
 from clawake.services.runtime_upgrade import browser_cache_path, is_browser_image
 
 
@@ -58,6 +59,7 @@ def render_shared_network(network: NetworkSpec) -> str:
 
 
 def render_inventory(inventory: Inventory, output_dir: Path, template_root: Path) -> list[Path]:
+    require_v1_runtime(inventory)
     output_dir.mkdir(parents=True, exist_ok=True)
     rendered_paths: list[Path] = []
     for network in inventory.networks:

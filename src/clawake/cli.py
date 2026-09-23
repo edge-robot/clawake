@@ -10,6 +10,7 @@ import typer
 import yaml
 
 from clawake.config import ImageSpec, InstanceSpec, Inventory, load_inventory
+from clawake.inventory_validation import require_v1_runtime
 from clawake.services.backup import backup_instance, prune_backups
 from clawake.services.deployment import ArtifactChange, apply_artifacts, plan_deployment
 from clawake.services.gateway_config import (
@@ -49,10 +50,20 @@ TargetDigest = Annotated[str | None, typer.Option("--digest", help="Immutable ta
 _ENV_LINE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
 
-def _load(path: Path) -> Inventory:
+def _load(path: Path, *, validation_only: bool = False) -> Inventory:
     try:
-        return load_inventory(path)
-    except (ValueError, yaml.YAMLError, OSError) as exc:
+        inventory = load_inventory(path)
+        if not validation_only:
+            require_v1_runtime(inventory)
+        return inventory
+    except yaml.YAMLError as exc:
+        # Parser excerpts can contain credentials mistakenly placed in an inventory.
+        mark = getattr(exc, "problem_mark", None)
+        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        raise typer.BadParameter(
+            f"Cannot load {path}: invalid YAML{location}", param_hint="--config",
+        ) from exc
+    except (ValueError, OSError) as exc:
         raise typer.BadParameter(f"Cannot load {path}: {exc}", param_hint="--config") from exc
 
 
@@ -801,9 +812,16 @@ def teardown_quadlets(
 
 @app.command("validate")
 def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) -> None:
-    """Validate inventory and render selected members without writes or runtime calls."""
-    inventory = _load(config)
+    """Validate desired state offline; v2 is model-only until service rendering exists."""
+    inventory = _load(config, validation_only=True)
     selected = _select_instances(inventory, member)
+    if inventory.version == 2:
+        typer.echo(
+            f"Valid inventory v2: {inventory.cluster.name}; {len(inventory.instances)} member(s), "
+            f"{len(inventory.services)} service(s), {len(inventory.networks)} network(s). "
+            "Model validation only; no rendering or runtime/secret existence checks."
+        )
+        return
     changes = plan_deployment(inventory, selected, _template_root())
     typer.echo(
         f"Valid inventory: {inventory.cluster.name}; {len(selected)} member(s), "

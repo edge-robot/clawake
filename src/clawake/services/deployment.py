@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from clawake.config import InstanceSpec, Inventory
+from clawake.inventory_validation import require_v1_runtime
 from clawake.services.render import render_instance_assets, render_shared_network
 from clawake.services.runtime_config import plan_runtime_files
 
@@ -27,6 +28,7 @@ def plan_deployment(
     inventory: Inventory, instances: list[InstanceSpec], template_root: Path
 ) -> list[ArtifactChange]:
     """Render desired state in memory and compare it with installed artifacts."""
+    require_v1_runtime(inventory)
     hosts = {host.name: host for host in inventory.hosts}
     changes = []
     required_networks = {name for instance in instances for name in instance.networks}
