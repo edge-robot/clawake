@@ -5,15 +5,30 @@ import re
 from collections.abc import Mapping
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import yaml
+from pydantic import AfterValidator, ConfigDict, Field, JsonValue, field_validator, model_validator
 from pydantic import BaseModel as PydanticBaseModel
-from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
+
+from clawake.inventory_validation import (
+    dependency_order,
+    host_path,
+    interface_url,
+    resource_name,
+    single_line,
+    target_path,
+    validate_v2_inventory,
+)
 
 
 class BaseModel(PydanticBaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+
+ResourceName = Annotated[str, AfterValidator(resource_name)]
+HostPath = Annotated[str, AfterValidator(host_path)]
+TargetPath = Annotated[str, AfterValidator(target_path)]
 
 
 def bind_addresses_overlap(first: str, second: str) -> bool:
@@ -21,8 +36,11 @@ def bind_addresses_overlap(first: str, second: str) -> bool:
     a, b = ip_address(first), ip_address(second)
     a = getattr(a, "ipv4_mapped", None) or a
     b = getattr(b, "ipv4_mapped", None) or b
-    return a == b or str(a) == "::" or str(b) == "::" or (
-        a.version == b.version and (a.is_unspecified or b.is_unspecified)
+    return (
+        a == b
+        or str(a) == "::"
+        or str(b) == "::"
+        or (a.version == b.version and (a.is_unspecified or b.is_unspecified))
     )
 
 
@@ -164,6 +182,124 @@ class DashboardMeta(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class ServiceImageSpec(ImageSpec):
+    """Explicit service image reference; legacy instance images stay compatible."""
+
+    @model_validator(mode="after")
+    def validate_reference(self) -> ServiceImageSpec:
+        parts = self.repository.split("/")
+        if len(parts) > 1 and ":" in parts[0]:
+            registry, port = parts[0].rsplit(":", 1)
+            if not port.isdigit() or not 1 <= int(port) <= 65535:
+                raise ValueError("Invalid image registry port")
+            parts[0] = registry
+        if any(not re.fullmatch(r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*", p) for p in parts):
+            raise ValueError("Invalid image repository")
+        for tag in (self.tag, self.known_good_tag):
+            if tag is not None and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+                raise ValueError("Invalid image tag")
+        for digest in (self.digest, self.known_good_digest):
+            if digest is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise ValueError("Image digest must be a complete SHA-256 digest")
+        if self.tag.lower() in {"latest", "stable", "edge", "main", "dev"} and not self.digest:
+            raise ValueError("Floating image tags require a digest")
+        return self
+
+
+class ServiceMountSpec(MountSpec):
+    source: HostPath
+    target: TargetPath
+
+
+class VolumeSpec(BaseModel):
+    name: ResourceName
+    target: TargetPath
+    read_only: bool = False
+
+
+class SecretRef(BaseModel):
+    name: ResourceName
+    target: ResourceName | None = None
+
+    @property
+    def container_path(self) -> str:
+        return f"/run/secrets/{self.target or self.name}"
+
+
+class ServiceHealthSpec(HealthSpec):
+    scheme: Literal["http", "https"] = "http"
+    port: int = Field(ge=1, le=65535)
+    path: str = Field(default="/health/ready", pattern=r"^/[A-Za-z0-9/_.-]*$")
+    interval_seconds: int = Field(default=30, ge=1)
+    timeout_seconds: int = Field(default=5, ge=1)
+    retries: int = Field(default=3, ge=1)
+
+
+class ServiceInterfaceSpec(BaseModel):
+    url: Annotated[str, AfterValidator(interface_url)]
+
+
+class ServiceBackupPolicy(BackupPolicy):
+    paths: list[HostPath] = Field(default_factory=list)
+
+
+class ServiceSpec(BaseModel):
+    name: ResourceName
+    host: ResourceName
+    image: ServiceImageSpec
+    networks: list[ResourceName] = Field(min_length=1)
+    command: list[Annotated[str, AfterValidator(single_line)]] | None = Field(
+        default=None,
+        min_length=1,
+    )
+    env_files: list[HostPath] = Field(default_factory=list)
+    ports: list[PortSpec] = Field(default_factory=list)
+    mounts: list[ServiceMountSpec] = Field(default_factory=list)
+    volumes: list[VolumeSpec] = Field(default_factory=list)
+    secrets: list[SecretRef] = Field(default_factory=list)
+    health: ServiceHealthSpec | None = None
+    depends_on: list[ResourceName] = Field(default_factory=list)
+    restart_policy: Literal["always", "on-failure", "no"] = "always"
+    backup_policy: ServiceBackupPolicy = Field(default_factory=ServiceBackupPolicy)
+    interfaces: dict[ResourceName, ServiceInterfaceSpec] = Field(default_factory=dict)
+    dashboard: DashboardMeta | None = None
+
+    @property
+    def container_name(self) -> str:
+        return self.name
+
+    @property
+    def quadlet_path(self) -> str:
+        return f"{self.name}.container"
+
+    def volume_name(self, name: str) -> str:
+        return f"{self.name}-{name}"
+
+    @property
+    def quadlet_artifact_paths(self) -> list[str]:
+        return [self.quadlet_path, *(f"{self.volume_name(v.name)}.volume" for v in self.volumes)]
+
+    @model_validator(mode="after")
+    def validate_storage(self) -> ServiceSpec:
+        for values, label in (
+            ([v.name for v in self.volumes], "volume names"),
+            ([s.name for s in self.secrets], "secret references"),
+            ([s.container_path for s in self.secrets], "secret targets"),
+            (self.env_files, "environment paths"),
+            (self.backup_policy.paths, "backup paths"),
+            ([m.target for m in [*self.mounts, *self.volumes]], "mount targets"),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"Duplicate {label}")
+        for secret in self.secrets:
+            for mount in [*self.mounts, *self.volumes]:
+                if Path(secret.container_path).is_relative_to(mount.target) or Path(
+                    mount.target
+                ).is_relative_to(secret.container_path):
+                    raise ValueError("Mount shadows a secret target")
+        return self
+
+
 class SubagentSpec(BaseModel):
     max_spawn_depth: int = Field(default=1, ge=1, le=5)
     max_children_per_agent: int = Field(default=3, ge=1, le=20)
@@ -208,6 +344,7 @@ class InstanceSpec(BaseModel):
     image: ImageSpec
     ports: list[PortSpec] = Field(default_factory=list)
     networks: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
     openclaw: OpenClawSpec | None = None
     mounts: list[MountSpec] = Field(default_factory=list)
     plugins: list[PluginSpec] = Field(default_factory=list)
@@ -294,11 +431,42 @@ class InstanceSpec(BaseModel):
 
 
 class Inventory(BaseModel):
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 1
     cluster: ClusterSpec
     hosts: list[HostSpec]
     instances: list[InstanceSpec]
     networks: list[NetworkSpec] = Field(default_factory=list)
+    services: list[ServiceSpec] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def v2_defaults(cls, data: object) -> object:
+        if not isinstance(data, Mapping) or data.get("version") != 2:
+            return data
+        result = dict(data)
+        result.setdefault("instances", [])
+        cluster = result.get("cluster")
+        primary = (
+            cluster.get("primary_host")
+            if isinstance(cluster, Mapping)
+            else getattr(cluster, "primary_host", None)
+        )
+        networks = result.get("networks")
+        if primary and isinstance(networks, list):
+            result["networks"] = [
+                {"host": primary, **network} if isinstance(network, Mapping) else network
+                for network in networks
+            ]
+        return result
+
+    def dependency_order(self) -> list[str]:
+        return dependency_order(self)
+
+    def validate_secret_references(self, available_names: set[str]) -> None:
+        required = {secret.name for service in self.services for secret in service.secrets}
+        missing = sorted(required - available_names)
+        if missing:
+            raise ValueError("Missing Podman secret references: " + ", ".join(missing))
 
     @model_validator(mode="after")
     def validate_inventory(self) -> Inventory:
@@ -334,6 +502,12 @@ class Inventory(BaseModel):
                 f"cluster.primary_host '{self.cluster.primary_host}' does not match any host"
             )
 
+        if self.version == 1:
+            if self.services or any(item.depends_on for item in self.instances):
+                raise ValueError("Services and dependencies require inventory version 2")
+        else:
+            validate_v2_inventory(self)
+
         instance_names: set[str] = set()
         network_map = {network.name: network for network in self.networks}
         if len(network_map) != len(self.networks):
@@ -342,9 +516,7 @@ class Inventory(BaseModel):
             if network.host not in host_names:
                 raise ValueError(f"Unknown network host: {network.host}")
         container_names: set[tuple[str, str]] = set()
-        artifact_paths = {
-            (network.host, network.quadlet_path) for network in self.networks
-        }
+        artifact_paths = {(network.host, network.quadlet_path) for network in self.networks}
         used_ports: dict[tuple[str, str, int, str], str] = {}
         used_paths: dict[str, tuple[str, str]] = {}
 
@@ -433,7 +605,8 @@ class Inventory(BaseModel):
                 port_key = (instance.host, port.bind_address, port.host_port, port.protocol)
                 for (host, address, number, protocol), owner in used_ports.items():
                     if (
-                        host == instance.host and number == port.host_port
+                        host == instance.host
+                        and number == port.host_port
                         and protocol == port.protocol
                         and bind_addresses_overlap(address, port.bind_address)
                     ):
@@ -484,8 +657,10 @@ class Inventory(BaseModel):
                     )
                 if target.openclaw is None or not target.openclaw.a2a.enabled:
                     raise ValueError(f"A2A target is not enabled: {target.name}")
-                reverse = next((p for p in target.openclaw.a2a.peers.values()
-                                if p.instance == instance.name), None)
+                reverse = next(
+                    (p for p in target.openclaw.a2a.peers.values() if p.instance == instance.name),
+                    None,
+                )
                 if reverse is None or (
                     reverse.inbound_token_env != peer.outbound_token_env
                     or reverse.outbound_token_env != peer.inbound_token_env

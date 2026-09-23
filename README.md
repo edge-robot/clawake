@@ -57,6 +57,11 @@ your team before applying it. Validation checks the inventory, rendering and
 installed artifact differences; it does not verify image availability or host
 runtime readiness.
 
+Inventory v2 adds offline validation for generic services alongside instances.
+See the [v2 model and validation boundary](docs/inventory-v2.md). In this increment,
+v2 rendering and lifecycle commands are blocked until service support is complete;
+existing v1 inventories retain their deployment behavior.
+
 For a complete three-member setup, see the [robotics team](robotics-team/README.md),
 whose three leads combine product and technical leadership, robotics engineering,
 and project, customer and supplier coordination. They communicate through OpenClaw
