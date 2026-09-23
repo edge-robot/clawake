@@ -36,8 +36,11 @@ def bind_addresses_overlap(first: str, second: str) -> bool:
     a, b = ip_address(first), ip_address(second)
     a = getattr(a, "ipv4_mapped", None) or a
     b = getattr(b, "ipv4_mapped", None) or b
-    return a == b or str(a) == "::" or str(b) == "::" or (
-        a.version == b.version and (a.is_unspecified or b.is_unspecified)
+    return (
+        a == b
+        or str(a) == "::"
+        or str(b) == "::"
+        or (a.version == b.version and (a.is_unspecified or b.is_unspecified))
     )
 
 
@@ -246,7 +249,8 @@ class ServiceSpec(BaseModel):
     image: ServiceImageSpec
     networks: list[ResourceName] = Field(min_length=1)
     command: list[Annotated[str, AfterValidator(single_line)]] | None = Field(
-        default=None, min_length=1,
+        default=None,
+        min_length=1,
     )
     env_files: list[HostPath] = Field(default_factory=list)
     ports: list[PortSpec] = Field(default_factory=list)
@@ -273,9 +277,7 @@ class ServiceSpec(BaseModel):
 
     @property
     def quadlet_artifact_paths(self) -> list[str]:
-        return [self.quadlet_path, *(
-            f"{self.volume_name(v.name)}.volume" for v in self.volumes
-        )]
+        return [self.quadlet_path, *(f"{self.volume_name(v.name)}.volume" for v in self.volumes)]
 
     @model_validator(mode="after")
     def validate_storage(self) -> ServiceSpec:
@@ -291,10 +293,9 @@ class ServiceSpec(BaseModel):
                 raise ValueError(f"Duplicate {label}")
         for secret in self.secrets:
             for mount in [*self.mounts, *self.volumes]:
-                if (
-                    Path(secret.container_path).is_relative_to(mount.target)
-                    or Path(mount.target).is_relative_to(secret.container_path)
-                ):
+                if Path(secret.container_path).is_relative_to(mount.target) or Path(
+                    mount.target
+                ).is_relative_to(secret.container_path):
                     raise ValueError("Mount shadows a secret target")
         return self
 
@@ -446,7 +447,8 @@ class Inventory(BaseModel):
         result.setdefault("instances", [])
         cluster = result.get("cluster")
         primary = (
-            cluster.get("primary_host") if isinstance(cluster, Mapping)
+            cluster.get("primary_host")
+            if isinstance(cluster, Mapping)
             else getattr(cluster, "primary_host", None)
         )
         networks = result.get("networks")
@@ -514,9 +516,7 @@ class Inventory(BaseModel):
             if network.host not in host_names:
                 raise ValueError(f"Unknown network host: {network.host}")
         container_names: set[tuple[str, str]] = set()
-        artifact_paths = {
-            (network.host, network.quadlet_path) for network in self.networks
-        }
+        artifact_paths = {(network.host, network.quadlet_path) for network in self.networks}
         used_ports: dict[tuple[str, str, int, str], str] = {}
         used_paths: dict[str, tuple[str, str]] = {}
 
@@ -605,7 +605,8 @@ class Inventory(BaseModel):
                 port_key = (instance.host, port.bind_address, port.host_port, port.protocol)
                 for (host, address, number, protocol), owner in used_ports.items():
                     if (
-                        host == instance.host and number == port.host_port
+                        host == instance.host
+                        and number == port.host_port
                         and protocol == port.protocol
                         and bind_addresses_overlap(address, port.bind_address)
                     ):
@@ -656,8 +657,10 @@ class Inventory(BaseModel):
                     )
                 if target.openclaw is None or not target.openclaw.a2a.enabled:
                     raise ValueError(f"A2A target is not enabled: {target.name}")
-                reverse = next((p for p in target.openclaw.a2a.peers.values()
-                                if p.instance == instance.name), None)
+                reverse = next(
+                    (p for p in target.openclaw.a2a.peers.values() if p.instance == instance.name),
+                    None,
+                )
                 if reverse is None or (
                     reverse.inbound_token_env != peer.outbound_token_env
                     or reverse.outbound_token_env != peer.inbound_token_env

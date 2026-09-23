@@ -61,7 +61,8 @@ def _load(path: Path, *, validation_only: bool = False) -> Inventory:
         mark = getattr(exc, "problem_mark", None)
         location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
         raise typer.BadParameter(
-            f"Cannot load {path}: invalid YAML{location}", param_hint="--config",
+            f"Cannot load {path}: invalid YAML{location}",
+            param_hint="--config",
         ) from exc
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(f"Cannot load {path}: {exc}", param_hint="--config") from exc
@@ -299,9 +300,7 @@ def _deploy_instance_assets(
 
 def _print_plan(changes: list[ArtifactChange]) -> None:
     for change in changes:
-        typer.echo(
-            f" - {change.member} [{change.role}] {change.kind}: write {change.destination}"
-        )
+        typer.echo(f" - {change.member} [{change.role}] {change.kind}: write {change.destination}")
         if change.changed_keys:
             typer.echo(f"   changed keys: {', '.join(change.changed_keys)}")
 

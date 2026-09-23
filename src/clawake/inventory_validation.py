@@ -32,7 +32,7 @@ def safe_path(value: str, *, host: bool) -> str:
     if host:
         value = os.path.expanduser(os.path.expandvars(value))
     single_line(value)
-    if any(c.isspace() or c in ':\\%$\"\'' for c in value):
+    if any(c.isspace() or c in ":\\%$\"'" for c in value):
         raise ValueError("Path contains unsupported whitespace, variable or delimiter characters")
     if not value.startswith("/") or value.startswith("//"):
         raise ValueError("Path must be an absolute path")
@@ -54,7 +54,7 @@ def target_path(value: str) -> str:
 
 def interface_url(value: str) -> str:
     single_line(value)
-    if any(c.isspace() for c in value) or any(c in value for c in ('\\', '"', "'", "$", "%")):
+    if any(c.isspace() for c in value) or any(c in value for c in ("\\", '"', "'", "$", "%")):
         raise ValueError("Interface URL contains unsupported characters")
     try:
         parsed = urlsplit(value)
@@ -134,7 +134,7 @@ def validate_v2_inventory(inventory: Inventory) -> None:
         parts = path.split("/")
         if path.startswith("/") or any(p in {"", ".", ".."} for p in parts):
             raise ValueError("Quadlet path must be a safe relative path")
-        if any(c.isspace() or c in ':\\%$\"\'' for c in path):
+        if any(c.isspace() or c in ":\\%$\"'" for c in path):
             raise ValueError("Unsafe Quadlet path")
         stem, suffix = PurePosixPath(path).stem, PurePosixPath(path).suffix
         unit_suffix = {".container": "", ".network": "-network", ".volume": "-volume"}[suffix]
@@ -168,7 +168,8 @@ def validate_v2_inventory(inventory: Inventory) -> None:
         for port in item.ports:
             for other in used_ports:
                 if (
-                    port.host_port == other.host_port and port.protocol == other.protocol
+                    port.host_port == other.host_port
+                    and port.protocol == other.protocol
                     and bind_addresses_overlap(port.bind_address, other.bind_address)
                 ):
                     raise ValueError(f"Port collision involving {item.name}")

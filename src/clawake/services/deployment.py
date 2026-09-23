@@ -39,22 +39,42 @@ def plan_deployment(
         content = render_shared_network(network)
         current = destination.read_text(encoding="utf-8") if destination.exists() else None
         if current != content:
-            changes.append(ArtifactChange(
-                network.name, "shared_network", destination, content, previous=current,
-            ))
+            changes.append(
+                ArtifactChange(
+                    network.name,
+                    "shared_network",
+                    destination,
+                    content,
+                    previous=current,
+                )
+            )
     for instance in instances:
         root = Path(hosts[instance.host].quadlet_root).expanduser()
         for relative, content in render_instance_assets(instance, template_root).items():
             destination = root / relative
             current = destination.read_text(encoding="utf-8") if destination.exists() else None
             if current != content:
-                changes.append(ArtifactChange(
-                    instance.name, instance.role, destination, content, previous=current,
-                ))
+                changes.append(
+                    ArtifactChange(
+                        instance.name,
+                        instance.role,
+                        destination,
+                        content,
+                        previous=current,
+                    )
+                )
         for destination, content, current, keys in plan_runtime_files(inventory, instance):
-            changes.append(ArtifactChange(
-                instance.name, instance.role, destination, content, "runtime", current, keys,
-            ))
+            changes.append(
+                ArtifactChange(
+                    instance.name,
+                    instance.role,
+                    destination,
+                    content,
+                    "runtime",
+                    current,
+                    keys,
+                )
+            )
     return changes
 
 
@@ -62,8 +82,9 @@ def apply_artifacts(changes: list[ArtifactChange]) -> list[Path]:
     """Write a reviewed plan. The caller owns runtime preparation and reloads."""
     # Detect drift before applying any part of the plan; never print file contents.
     for change in changes:
-        current = (change.destination.read_text(encoding="utf-8")
-                   if change.destination.exists() else None)
+        current = (
+            change.destination.read_text(encoding="utf-8") if change.destination.exists() else None
+        )
         if current != change.previous:
             raise ValueError(f"Configuration changed since planning: {change.destination}")
     deployed = []
