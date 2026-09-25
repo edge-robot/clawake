@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,11 @@ from clawake.cli import app
 from clawake.services.systemd import CommandResult
 
 runner = CliRunner()
+
+
+def _plain_output(text: str) -> str:
+    """Keep error assertions independent of CI-forced ANSI styling."""
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
 
 
 def _write_inventory(
@@ -164,7 +170,7 @@ def test_upgrade_rejects_unpinned_new_tag(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2
-    assert "immutable --digest is required" in result.output
+    assert "immutable --digest is required" in _plain_output(result.output)
 
 
 def test_upgrade_execute_runs_backup_migration_and_health_checks(
@@ -286,7 +292,6 @@ def test_setup_quadlets_execute_deploys_files(monkeypatch: object, tmp_path: Pat
             "http://127.0.0.1:18789",
             "http://localhost:18789",
         ],
-        "allowInsecureAuth": True,
     }
     assert RecordingSystemdService.daemon_reload_calls == 1
     assert RecordingSystemdService.restart_calls == 1
@@ -520,7 +525,7 @@ def test_invalid_yaml_reports_config_error(tmp_path: Path) -> None:
     result = runner.invoke(app, ["validate", "-c", str(config)])
     assert result.exit_code == 2
     assert "Cannot load" in result.output
-    assert "--config" in result.output
+    assert "--config" in _plain_output(result.output)
 
 
 def test_unknown_member_lists_available_members(tmp_path: Path) -> None:
