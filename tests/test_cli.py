@@ -292,7 +292,6 @@ def test_setup_quadlets_execute_deploys_files(monkeypatch: object, tmp_path: Pat
             "http://127.0.0.1:18789",
             "http://localhost:18789",
         ],
-        "allowInsecureAuth": True,
     }
     assert RecordingSystemdService.daemon_reload_calls == 1
     assert RecordingSystemdService.restart_calls == 1
