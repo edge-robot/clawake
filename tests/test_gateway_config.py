@@ -70,7 +70,6 @@ def test_creates_minimal_local_control_ui_config(tmp_path: Path) -> None:
                     "http://127.0.0.1:18989",
                     "http://localhost:18989",
                 ],
-                "allowInsecureAuth": True,
             }
         }
     }
