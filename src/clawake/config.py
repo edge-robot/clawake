@@ -65,6 +65,7 @@ class HostSpec(BaseModel):
 
 
 class NetworkSpec(BaseModel):
+    quadlet_default_dependencies: bool = True
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     host: str
 
@@ -332,6 +333,7 @@ class OpenClawSpec(BaseModel):
 
 
 class InstanceSpec(BaseModel):
+    quadlet_default_dependencies: bool = True
     name: str
     legacy_names: list[str] = Field(default_factory=list)
     host: str

@@ -52,8 +52,11 @@ def render_instance_assets(instance: InstanceSpec, template_root: Path) -> dict[
 
 
 def render_shared_network(network: NetworkSpec) -> str:
+    quadlet = (
+        "" if network.quadlet_default_dependencies else "[Quadlet]\nDefaultDependencies=false\n\n"
+    )
     return (
-        f"[Unit]\nDescription=Clawake shared network {network.name}\n\n"
+        quadlet + f"[Unit]\nDescription=Clawake shared network {network.name}\n\n"
         f"[Network]\nNetworkName={network.name}\nNetworkDeleteOnStop=true\n"
     )
 
