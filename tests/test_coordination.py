@@ -33,11 +33,17 @@ def config_path(member):
     return Path(member.workspace_path) / ".openclaw/openclaw.json"
 
 
-@pytest.mark.parametrize("first,second", [
-    ("127.0.0.1", "127.0.0.1"), ("0.0.0.0", "127.0.0.1"),
-    ("127.0.0.1", "0.0.0.0"), ("::", "127.0.0.1"),
-    ("::1", "0:0:0:0:0:0:0:1"), ("::ffff:127.0.0.1", "127.0.0.1"),
-])
+@pytest.mark.parametrize(
+    "first,second",
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("0.0.0.0", "127.0.0.1"),
+        ("127.0.0.1", "0.0.0.0"),
+        ("::", "127.0.0.1"),
+        ("::1", "0:0:0:0:0:0:0:1"),
+        ("::ffff:127.0.0.1", "127.0.0.1"),
+    ],
+)
 def test_overlapping_host_ports_rejected(team, first, second):
     data = team.model_dump()
     one, two = data["instances"][:2]
@@ -54,18 +60,32 @@ def test_separate_addresses_and_container_ports_are_allowed(team):
     Inventory.model_validate(data)
 
 
-@pytest.mark.parametrize("mutate,match", [
-    (lambda d: d.update(unknown=True), "Extra inputs"),
-    (lambda d: d["instances"][0]["openclaw"]["subagents"].update(max_concurent=4), "Extra inputs"),
-    (lambda d: d["instances"][0].update(networks=["missing"]), "network"),
-    (lambda d: d["instances"][0].update(networks=[]), "shared network"),
-    (lambda d: d["instances"][0]["openclaw"]["a2a"]["peers"]["engineering"].update(
-        instance="missing"), "A2A target"),
-    (lambda d: d["instances"][0]["openclaw"]["a2a"]["peers"]["engineering"].update(
-        outbound_token_env="WRONG_DIRECTION"), "reciprocal token"),
-    (lambda d: d["instances"][1].update(container_name="robotics-product-owner"), "container"),
-    (lambda d: d["networks"][0].update(name="../escape"), "pattern"),
-])
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda d: d.update(unknown=True), "Extra inputs"),
+        (
+            lambda d: d["instances"][0]["openclaw"]["subagents"].update(max_concurent=4),
+            "Extra inputs",
+        ),
+        (lambda d: d["instances"][0].update(networks=["missing"]), "network"),
+        (lambda d: d["instances"][0].update(networks=[]), "shared network"),
+        (
+            lambda d: d["instances"][0]["openclaw"]["a2a"]["peers"]["engineering"].update(
+                instance="missing"
+            ),
+            "A2A target",
+        ),
+        (
+            lambda d: d["instances"][0]["openclaw"]["a2a"]["peers"]["engineering"].update(
+                outbound_token_env="WRONG_DIRECTION"
+            ),
+            "reciprocal token",
+        ),
+        (lambda d: d["instances"][1].update(container_name="robotics-product-owner"), "container"),
+        (lambda d: d["networks"][0].update(name="../escape"), "pattern"),
+    ],
+)
 def test_invalid_topology_rejected(team, mutate, match):
     data = team.model_dump()
     mutate(data)
@@ -88,11 +108,15 @@ def test_runtime_merge_preserves_operator_config_and_secret_references(team, mon
     member = team.instances[0]
     path = config_path(member)
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({
-        "models": {"providers": {"custom": {"apiKey": "private-existing-key"}}},
-        "agents": {"entries": {"main": {"model": "custom/model"}}},
-        "bindings": [{"agentId": "main", "match": {"channel": "telegram"}}],
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "models": {"providers": {"custom": {"apiKey": "private-existing-key"}}},
+                "agents": {"entries": {"main": {"model": "custom/model"}}},
+                "bindings": [{"agentId": "main", "match": {"channel": "telegram"}}],
+            }
+        )
+    )
     monkeypatch.setenv("A2A_ENGINEERING_TO_PRODUCT", "must-not-be-expanded")
     plan = plan_deployment(team, team.instances, TEMPLATES)
     assert "private-existing-key" not in repr(plan)
@@ -153,9 +177,11 @@ def test_apply_refuses_stale_plan_before_any_writes(team):
 
 
 @pytest.mark.parametrize("member,remove_network", [("robotics-engineer", False), (None, True)])
-def test_teardown_keeps_network_for_other_members(team, tmp_path, monkeypatch, member,
-                                                 remove_network):
+def test_teardown_keeps_network_for_other_members(
+    team, tmp_path, monkeypatch, member, remove_network
+):
     from clawake import cli
+
     removed = []
 
     class Service:
@@ -187,8 +213,9 @@ def test_setup_and_upgrade_preview_same_runtime_plan(team, tmp_path):
     member = team.instances[0]
     runner = CliRunner()
     setup = runner.invoke(app, ["setup", "-c", str(cfg), "-m", member.name])
-    upgrade = runner.invoke(app, ["upgrade", "-c", str(cfg), "-m", member.name,
-                                  "--to", member.image.tag])
+    upgrade = runner.invoke(
+        app, ["upgrade", "-c", str(cfg), "-m", member.name, "--to", member.image.tag]
+    )
     assert setup.exit_code == upgrade.exit_code == 0
     assert [line for line in setup.output.splitlines() if "runtime:" in line] == [
         line for line in upgrade.output.splitlines() if "runtime:" in line
@@ -210,8 +237,10 @@ def test_mismatched_peer_credentials_fail_before_writes(team, tmp_path):
     for index, member in enumerate(team.instances):
         lines = ["OPENCLAW_GATEWAY_TOKEN=gateway"]
         for peer in member.openclaw.a2a.peers.values():
-            lines.extend(f"{key}=different-{index}" for key in
-                         (peer.inbound_token_env, peer.outbound_token_env))
+            lines.extend(
+                f"{key}=different-{index}"
+                for key in (peer.inbound_token_env, peer.outbound_token_env)
+            )
         Path(member.env_files[0]).write_text("\n".join(lines))
     cfg = tmp_path / "inventory.yml"
     cfg.write_text(yaml.safe_dump(team.model_dump()))
@@ -238,7 +267,9 @@ def test_quadlet_generator_accepts_shared_network(team, tmp_path):
     result = subprocess.run(
         [str(generator), "-user", "-dryrun"],
         env={**os.environ, "QUADLET_UNIT_DIRS": str(root)},
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert "unsupported key" not in result.stderr.lower()
@@ -263,7 +294,9 @@ def test_lead_policy_changes_are_applied_without_losing_model(team):
 
 
 def test_upgrade_replans_after_migration_and_preserves_operator_settings(
-    team, tmp_path, monkeypatch,
+    team,
+    tmp_path,
+    monkeypatch,
 ):
     from clawake import cli
 
@@ -298,11 +331,19 @@ def test_upgrade_replans_after_migration_and_preserves_operator_settings(
     monkeypatch.setattr(cli, "check_image_availability", lambda image: None)
     monkeypatch.setattr(cli, "run_doctor", migrate)
     monkeypatch.setattr(cli, "wait_for_health", lambda instance: (True, "healthy"))
-    monkeypatch.setattr(cli, "verify_runtime", lambda instance, image: SimpleNamespace(
-        healthy=True, version="2026.9.4", image_name="verified", error="",
-    ))
-    result = CliRunner().invoke(app, ["upgrade", "-c", str(cfg), "-m", member.name,
-                                    "--to", member.image.tag, "--execute"])
+    monkeypatch.setattr(
+        cli,
+        "verify_runtime",
+        lambda instance, image: SimpleNamespace(
+            healthy=True,
+            version="2026.9.4",
+            image_name="verified",
+            error="",
+        ),
+    )
+    result = CliRunner().invoke(
+        app, ["upgrade", "-c", str(cfg), "-m", member.name, "--to", member.image.tag, "--execute"]
+    )
     assert result.exit_code == 0, result.output
     assert "secret-marker" not in result.output
     payload = json.loads(config_path(member).read_text())

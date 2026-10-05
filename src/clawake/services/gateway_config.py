@@ -107,10 +107,7 @@ def configure_control_ui(instance: InstanceSpec, payload: dict[str, object]) -> 
     if not isinstance(existing_origins, list) or not all(
         isinstance(origin, str) for origin in existing_origins
     ):
-        raise ValueError(
-            "OpenClaw config: gateway.controlUi.allowedOrigins "
-            "must be a string array"
-        )
+        raise ValueError("OpenClaw config: gateway.controlUi.allowedOrigins must be a string array")
 
     changed = False
     merged_origins = list(dict.fromkeys([*existing_origins, *origins]))

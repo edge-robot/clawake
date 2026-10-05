@@ -47,9 +47,16 @@ def _update_image_fields(config_path: Path, instance_name: str, updates: dict[st
     lines = raw.splitlines(keepends=True)
     document = yaml.compose(raw)
     instances = next(value for key, value in document.value if key.value == "instances")
-    selected = next((node for node in instances.value if any(
-        key.value == "name" and value.value == instance_name for key, value in node.value
-    )), None)
+    selected = next(
+        (
+            node
+            for node in instances.value
+            if any(
+                key.value == "name" and value.value == instance_name for key, value in node.value
+            )
+        ),
+        None,
+    )
     if selected is None:
         raise ValueError(f"Unknown instance '{instance_name}'")
     image_pair = next(((key, value) for key, value in selected.value if key.value == "image"), None)
@@ -57,15 +64,20 @@ def _update_image_fields(config_path: Path, instance_name: str, updates: dict[st
         raise ValueError(f"Instance '{instance_name}' does not define image")
     image_key, image_node = image_pair
     # Editing an alias would also modify another instance's image.
-    if any(value is image_node for node in instances.value if node is not selected
-           for key, value in node.value if key.value == "image"):
+    if any(
+        value is image_node
+        for node in instances.value
+        if node is not selected
+        for key, value in node.value
+        if key.value == "image"
+    ):
         raise ValueError("Shared YAML image aliases must be expanded before upgrade")
     if image_node.flow_style:
         image = dict(_find_instance(yaml.safe_load(raw), instance_name)["image"])
         image.update(updates)
         replacement = yaml.safe_dump(image, default_flow_style=True, sort_keys=False).strip()
         config_path.write_text(
-            raw[:image_node.start_mark.index] + replacement + raw[image_node.end_mark.index:],
+            raw[: image_node.start_mark.index] + replacement + raw[image_node.end_mark.index :],
             encoding="utf-8",
         )
         return

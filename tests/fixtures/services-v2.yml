@@ -1,0 +1,31 @@
+# Offline model fixture only. This image is deliberately non-resolvable.
+version: 2
+cluster: {name: example, primary_host: local}
+hosts: [{name: local}]
+networks: [{name: team}]
+services:
+  - name: api
+    host: local
+    image:
+      repository: example.invalid/api
+      tag: "1.2.3"
+      digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    networks: [team]
+    command: [serve, --port, "8443"]
+    env_files: ["${CLAWAKE_PROJECT_ROOT}/config/api.env"]
+    ports:
+      - {host_port: 8443, container_port: 8443}
+    mounts:
+      - {source: "${CLAWAKE_PROJECT_ROOT}/state/api", target: /var/lib/api}
+      - {source: "${CLAWAKE_PROJECT_ROOT}/../ledger", target: /var/lib/api/ledger}
+    volumes:
+      - {name: cache, target: /var/cache/api}
+    secrets:
+      - {name: api-key, target: provider-key}
+    health: {scheme: https, port: 8443, path: /health/ready}
+    restart_policy: on-failure
+    backup_policy:
+      paths: ["${CLAWAKE_PROJECT_ROOT}/state/api", "${CLAWAKE_PROJECT_ROOT}/../ledger"]
+    interfaces:
+      api: {url: "https://api:8443/api"}
+    dashboard: {friendly_name: Example API, tags: [example]}

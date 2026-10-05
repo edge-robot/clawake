@@ -38,13 +38,15 @@ def desired_fields(inventory: Inventory, instance: InstanceSpec) -> dict:
     desired = {f"agents/entries/{settings.lead_agent_id}/workspace": "/workspace"}
     if settings.subagents:
         spec = settings.subagents
-        desired.update({
-            "agents/defaults/subagents/maxSpawnDepth": spec.max_spawn_depth,
-            "agents/defaults/subagents/maxChildrenPerAgent": spec.max_children_per_agent,
-            "agents/defaults/subagents/maxConcurrent": spec.max_concurrent,
-            "agents/defaults/subagents/runTimeoutSeconds": spec.run_timeout_seconds,
-            "tools/sessions/visibility": "tree",
-        })
+        desired.update(
+            {
+                "agents/defaults/subagents/maxSpawnDepth": spec.max_spawn_depth,
+                "agents/defaults/subagents/maxChildrenPerAgent": spec.max_children_per_agent,
+                "agents/defaults/subagents/maxConcurrent": spec.max_concurrent,
+                "agents/defaults/subagents/runTimeoutSeconds": spec.run_timeout_seconds,
+                "tools/sessions/visibility": "tree",
+            }
+        )
     desired["channels/a2a/enabled"] = settings.a2a.enabled
     desired["plugins/entries/a2a/enabled"] = settings.a2a.enabled
     if settings.a2a.enabled:
@@ -87,7 +89,8 @@ def _changed_keys(before: dict, after: dict, prefix: str = "") -> list[str]:
 
 
 def plan_runtime_files(
-    inventory: Inventory, instance: InstanceSpec,
+    inventory: Inventory,
+    instance: InstanceSpec,
 ) -> list[tuple[Path, str, str | None, tuple[str, ...]]]:
     """Return planned files and changed keys without writes or secret expansion."""
     root = Path(instance.workspace_path).expanduser() / ".openclaw"
@@ -126,13 +129,17 @@ def plan_runtime_files(
     bindings = [binding for binding in bindings if binding not in old_bindings]
     next_bindings = []
     if instance.openclaw and instance.openclaw.a2a.enabled:
-        if any(isinstance(binding, dict) and
-               binding.get("match", {}).get("channel") == "a2a" for binding in bindings):
+        if any(
+            isinstance(binding, dict) and binding.get("match", {}).get("channel") == "a2a"
+            for binding in bindings
+        ):
             raise ValueError("Refusing to replace unmanaged A2A routing bindings")
-        next_bindings = [{
-            "agentId": instance.openclaw.lead_agent_id,
-            "match": {"channel": "a2a"},
-        }]
+        next_bindings = [
+            {
+                "agentId": instance.openclaw.lead_agent_id,
+                "match": {"channel": "a2a"},
+            }
+        ]
     if next_bindings or old_bindings:
         payload["bindings"] = bindings + next_bindings
 
@@ -144,10 +151,22 @@ def plan_runtime_files(
             raise ValueError("Existing plugins.allow must include a2a before enabling A2A")
     result = []
     if payload != original or previous is None:
-        result.append((config_path, json.dumps(payload, indent=2) + "\n", previous,
-                       tuple(_changed_keys(original, payload))))
+        result.append(
+            (
+                config_path,
+                json.dumps(payload, indent=2) + "\n",
+                previous,
+                tuple(_changed_keys(original, payload)),
+            )
+        )
     next_state = {"version": 1, "fields": desired, "bindings": next_bindings}
     if (desired or state) and next_state != state:
-        result.append((state_path, json.dumps(next_state, indent=2) + "\n", previous_state,
-                       ("managed ownership ledger",)))
+        result.append(
+            (
+                state_path,
+                json.dumps(next_state, indent=2) + "\n",
+                previous_state,
+                ("managed ownership ledger",),
+            )
+        )
     return result
