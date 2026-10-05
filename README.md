@@ -154,3 +154,5 @@ uv run ruff check .
 
 Tests exercise rendering, validation and lifecycle operations with temporary files
 and simulated runtime adapters. They do not require deploying a live team.
+
+For fresh Omarchy source workspaces, use the [harness bootstrap guide](docs/omarchy-harness.md) and repo-scoped `clawake-harness` Codex skill.

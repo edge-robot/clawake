@@ -1,7 +1,14 @@
+{% if not instance.quadlet_default_dependencies %}
+[Quadlet]
+DefaultDependencies=false
+
+{% endif %}
 [Unit]
 Description=OpenClaw instance {{ instance.name }}
+{% if instance.quadlet_default_dependencies %}
 After=network-online.target
 Wants=network-online.target
+{% endif %}
 {% for legacy_name in instance.legacy_names %}
 Conflicts={{ legacy_name }}.service
 {% endfor %}
