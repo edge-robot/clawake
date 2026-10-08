@@ -247,6 +247,8 @@ class ServiceBackupPolicy(BackupPolicy):
 
 
 class ServiceSpec(BaseModel):
+    read_only: bool = False
+    user: str | None = Field(default=None, pattern=r"^[0-9]{1,10}:[0-9]{1,10}$")
     quadlet_default_dependencies: bool = True
     name: ResourceName
     host: ResourceName

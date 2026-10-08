@@ -111,6 +111,10 @@ def render_service_assets(service: ServiceSpec) -> dict[str, str]:
         f"NetworkAlias={service.name}",
         f"Label=clawake.service={service.name}",
     ]
+    if service.read_only:
+        lines.append("ReadOnly=true")
+    if service.user is not None:
+        lines.append(f"User={service.user}")
     for network in sorted(service.networks):
         lines.append(f"Network={network}.network")
     for path in service.env_files:
@@ -140,7 +144,8 @@ def render_service_assets(service: ServiceSpec) -> dict[str, str]:
         health = service.health
         # curl must be supplied by the service image. Never disable TLS verification.
         lines += [
-            f"HealthCmd=curl --fail --silent --show-error --max-time {health.timeout_seconds} "
+            "HealthCmd=curl --noproxy '*' --fail --silent --show-error "
+            f"--max-time {health.timeout_seconds} "
             f"{health.scheme}://{service.name}:{health.port}{health.path}",
             f"HealthInterval={health.interval_seconds}s",
             f"HealthTimeout={health.timeout_seconds}s",

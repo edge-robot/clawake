@@ -425,7 +425,6 @@ def test_member_selection_does_not_hide_invalid_services(mixed, tmp_path):
         ("upgrade", ["-m", "member", "--to", "2.0.0"]),
         ("onboard", ["-m", "member"]),
         ("dashboard", []),
-        ("sync-plugins", []),
     ],
 )
 def test_runtime_commands_reject_v2_before_any_side_effect(

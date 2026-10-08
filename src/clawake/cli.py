@@ -100,7 +100,7 @@ def sync_plugins(
     execute: ExecuteFlag = False,
 ) -> None:
     """Verify and install integrity-pinned OpenClaw plugins from the inventory."""
-    inventory = _load(config)
+    inventory = _load(config, validation_only=True)
     selected = _select_instances(inventory, member)
     declared = [(instance, plugin) for instance in selected for plugin in instance.plugins]
     if not declared:

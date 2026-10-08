@@ -45,7 +45,7 @@ def test_service_rendering_preserves_arguments_and_private_secrets(inventory):
     fixture = load_inventory(Path("tests/fixtures/services-v2.yml")).services[0]
     rendered = render_service_assets(fixture)["api.container"]
     assert "Secret=api-key,type=mount,target=provider-key,mode=0400" in rendered
-    assert "HealthCmd=curl --fail" in rendered and "--insecure" not in rendered
+    assert "HealthCmd=curl --noproxy" in rendered and "--insecure" not in rendered
 
 
 def test_plan_is_deterministic_shared_network_once_and_offline(inventory, tmp_path):
@@ -214,3 +214,11 @@ def test_generic_upgrade_backs_up_volume_and_preserves_inventory(inventory, tmp_
     assert run.call_args.args[0][:3] == ["podman", "volume", "export"]
     assert list((tmp_path / ".backups").glob("db-*/binds.tar.gz"))
     setup.assert_called_once()
+
+
+def test_service_user_can_match_private_host_mount_owner(inventory):
+    service = inventory.services[0]
+    service.user = "1234:1234"
+    service.read_only = True
+    assert "ReadOnly=true" in render_service_assets(service)["api.container"]
+    assert "User=1234:1234" in render_service_assets(service)["api.container"]

@@ -198,12 +198,14 @@ def status_rows(inventory: Inventory, member: str | None, service: str | None) -
             timeout=10,
         )
         match = re.fullmatch(
-            r"(sha256:[0-9a-f]{64}) ([0-9]{1,10}) (running|exited|created|paused|stopped)",
+            r"((?:sha256:)?[0-9a-f]{64}) ([0-9]{1,10}) (running|exited|created|paused|stopped)",
             result.stdout.strip(),
         )
         image_id, restart_count, container_state = (
             (match[1], int(match[2]), match[3]) if match else (None, None, "unavailable")
         )
+        if image_id and not image_id.startswith("sha256:"):
+            image_id = "sha256:" + image_id
         digest = None
         if image_id:
             image = subprocess.run(

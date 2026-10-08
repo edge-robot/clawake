@@ -130,5 +130,13 @@ explicit resource ordering remains active.
 Status reads only selected safe Podman fields: unit state, container state,
 configured image/digest, running image ID/digest, restart count, health/readiness and
 failed dependencies. It never prints full inspect output, environment or health logs.
-Onboard/dashboard/plugin-sync and the original member upgrade remain v1-only;
+Integrity-pinned plugin sync works for v2 members after their reviewed setup.
+Onboard/dashboard and the original member upgrade remain v1-only;
 service upgrades use the explicit generic command above.
+
+
+A service may set numeric `user: "UID:GID"` to match private host-bind ownership
+under keep-id. The image's USER is otherwise retained; keep-id alone does not
+replace an explicit image USER. `read_only: true` makes the image filesystem
+read-only while declared writable data mounts remain writable. Internal curl
+health probes use --noproxy to reach their own service DNS directly.
