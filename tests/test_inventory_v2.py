@@ -422,12 +422,6 @@ def test_member_selection_does_not_hide_invalid_services(mixed, tmp_path):
 @pytest.mark.parametrize(
     "command,args",
     [
-        ("setup", []),
-        ("setup-quadlets", ["--execute"]),
-        ("restart", ["--execute"]),
-        ("teardown", ["--execute"]),
-        ("status", []),
-        ("logs", ["-m", "member"]),
         ("upgrade", ["-m", "member", "--to", "2.0.0"]),
         ("onboard", ["-m", "member"]),
         ("dashboard", []),
@@ -456,10 +450,11 @@ def test_runtime_commands_reject_v2_before_any_side_effect(
     assert list(tmp_path.iterdir()) == [config]
 
 
-def test_public_rendering_and_planning_reject_v2_without_writes(data, tmp_path):
+def test_public_rendering_and_planning_support_v2(data, tmp_path):
+    data["hosts"][0]["quadlet_root"] = str(tmp_path / "quadlets")
     inventory = Inventory.model_validate(data)
-    with pytest.raises(ValueError, match="validation-only"):
-        render_inventory(inventory, tmp_path / "out", Path("templates"))
-    with pytest.raises(ValueError, match="validation-only"):
-        plan_deployment(inventory, inventory.instances, Path("templates"))
+    changes = plan_deployment(inventory, inventory.services, Path("templates"))
+    assert {c.destination.name for c in changes} == {"team.network", "api.container"}
     assert not list(tmp_path.iterdir())
+    paths = render_inventory(inventory, tmp_path / "out", Path("templates"))
+    assert {p.name for p in paths} == {"team.network", "api.container"}
