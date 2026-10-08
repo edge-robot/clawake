@@ -39,7 +39,7 @@ def test_service_rendering_preserves_arguments_and_private_secrets(inventory):
     service = inventory.services[0]
     service.command = ["serve", "space argument", 'literal"quote', "$literal", "%literal"]
     text = render_service_assets(service)["api.container"]
-    assert 'Exec="serve" "space argument" "literal\\"quote" "$literal" "%%literal"' in text
+    assert 'Exec="serve" "space argument" "literal\\"quote" "$$literal" "%%literal"' in text
     assert "Requires=db.service" in text and "Network=team.network" in text
     assert "UserNS=keep-id" in text
     fixture = load_inventory(Path("tests/fixtures/services-v2.yml")).services[0]
@@ -136,9 +136,16 @@ def test_status_does_not_expose_environment_or_health_output(inventory, monkeypa
     runtime.status.return_value.stdout = "DO-NOT-PRINT"
     monkeypatch.setattr("clawake.services.resources.SystemdService", lambda: runtime)
     monkeypatch.setattr("clawake.services.resources.readiness", lambda r: "running")
+    monkeypatch.setattr(
+        "subprocess.run",
+        Mock(
+            return_value=SimpleNamespace(returncode=0, stdout="sha256:" + "a" * 64 + " 2 running")
+        ),
+    )
     rows = status_rows(inventory, None, "api")
     assert len(rows) == 1 and rows[0]["active"] is True
     assert "DO-NOT-PRINT" not in str(rows)
+    assert rows[0]["restart_count"] == 2 and rows[0]["container_state"] == "running"
 
 
 def test_cli_service_preview_is_supported(inventory, tmp_path, monkeypatch):
@@ -150,3 +157,60 @@ def test_cli_service_preview_is_supported(inventory, tmp_path, monkeypatch):
     assert (
         "setup db" in result.output and "setup api" in result.output and "DRY RUN" in result.output
     )
+
+
+def test_service_can_disable_quadlet_online_dependency_without_losing_resource_order(inventory):
+    service = inventory.services[0]
+    service.quadlet_default_dependencies = False
+    text = render_service_assets(service)["api.container"]
+    assert "[Quadlet]\nDefaultDependencies=false" in text
+    assert "network-online.target" not in text
+    assert "Requires=db.service" in text
+
+
+def test_secret_mount_ownership_is_explicit(inventory):
+    from clawake.config import SecretRef
+
+    service = inventory.services[0]
+    service.secrets = [SecretRef(name="fixture-key", uid=1234, gid=1234)]
+    assert (
+        "Secret=fixture-key,type=mount,target=fixture-key,mode=0400,uid=1234,gid=1234"
+        in render_service_assets(service)["api.container"]
+    )
+
+
+def test_generic_upgrade_preview_is_offline_and_requires_consistent_backup(
+    inventory, tmp_path, monkeypatch
+):
+    from clawake.services.service_upgrade import upgrade_service
+
+    config = tmp_path / "team.yml"
+    config.write_text(yaml.safe_dump(inventory.model_dump()))
+    monkeypatch.setattr("subprocess.run", Mock(side_effect=AssertionError("runtime in preview")))
+    before = config.read_bytes()
+    plan = upgrade_service(config, "api", "2.0.0", "sha256:" + "c" * 64, Path("templates"))
+    assert "backup api" in plan and config.read_bytes() == before
+    with pytest.raises(ValueError, match="Dependent resources"):
+        upgrade_service(config, "db", "2.0.0", "sha256:" + "c" * 64, Path("templates"))
+
+
+def test_generic_upgrade_backs_up_volume_and_preserves_inventory(inventory, tmp_path, monkeypatch):
+    from clawake.services.service_upgrade import upgrade_service
+
+    inventory.services = [inventory.services[1]]
+    inventory.services[0].backup_policy.paths = []
+    config = tmp_path / "team.yml"
+    config.write_text(yaml.safe_dump(inventory.model_dump()))
+    runtime = Mock()
+    runtime.stop.return_value.return_code = 0
+    monkeypatch.setattr("clawake.services.service_upgrade.SystemdService", lambda: runtime)
+    run = Mock(return_value=SimpleNamespace(returncode=0))
+    monkeypatch.setattr("subprocess.run", run)
+    setup = Mock()
+    monkeypatch.setattr("clawake.services.service_upgrade.lifecycle", setup)
+    upgrade_service(config, "db", "2.0.0", "sha256:" + "c" * 64, Path("templates"), execute=True)
+    image = load_inventory(config).services[0].image
+    assert image.tag == "2.0.0" and image.known_good_tag == "1.2.3"
+    assert run.call_args.args[0][:3] == ["podman", "volume", "export"]
+    assert list((tmp_path / ".backups").glob("db-*/binds.tar.gz"))
+    setup.assert_called_once()

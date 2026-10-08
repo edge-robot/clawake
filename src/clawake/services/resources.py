@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from clawake.config import InstanceSpec, Inventory, ServiceSpec
@@ -101,10 +103,14 @@ def lifecycle(
     template_root: Path,
     *,
     execute: bool = False,
+    prepare_instances: Callable[[list[InstanceSpec]], None] | None = None,
+    selected_names: set[str] | None = None,
 ) -> list[str]:
     selected = select_resources(
         inventory, member, service_name, dependencies=action in {"setup", "restart"}
     )
+    if selected_names is not None:
+        selected = [r for r in select_resources(inventory, None, None) if r.name in selected_names]
     names = {r.name for r in selected}
     all_resources = [*inventory.instances, *inventory.services]
     if action == "teardown" and any(
@@ -129,6 +135,8 @@ def lifecycle(
                     not Path(p).is_file() for p in r.env_files
                 ):
                     raise ValueError(f"Missing declared input for service {r.name}")
+        if prepare_instances is not None:
+            prepare_instances([r for r in selected if isinstance(r, InstanceSpec)])
         if action == "setup":
             for r in selected:
                 if isinstance(r, InstanceSpec):
@@ -144,7 +152,10 @@ def lifecycle(
         for r in reversed(selected):
             if systemd.stop(r.name, execute=True).return_code:
                 raise ValueError(f"Cannot stop {r.name}; teardown halted")
-            if systemd.remove_container(r.container_name, execute=True).return_code:
+            result = systemd.remove_container(r.container_name, execute=True)
+            if result.return_code and not any(
+                text in result.stderr.lower() for text in ("no such container", "does not exist")
+            ):
                 raise ValueError(f"Cannot remove container {r.name}")
             for artifact in r.quadlet_artifact_paths:
                 if systemd.remove_quadlet(str(roots[r.host] / artifact), execute=True).return_code:
@@ -169,8 +180,53 @@ def lifecycle(
 def status_rows(inventory: Inventory, member: str | None, service: str | None) -> list[dict]:
     rows = []
     systemd = SystemdService()
+    resources = {r.name: r for r in [*inventory.instances, *inventory.services]}
+    states = {}
     for r in select_resources(inventory, member, service):
         unit = systemd.status(r.name, execute=True)
+        result = subprocess.run(
+            [
+                "podman",
+                "inspect",
+                "--format",
+                "{{.Image}} {{.RestartCount}} {{.State.Status}}",
+                r.container_name,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        match = re.fullmatch(
+            r"(sha256:[0-9a-f]{64}) ([0-9]{1,10}) (running|exited|created|paused|stopped)",
+            result.stdout.strip(),
+        )
+        image_id, restart_count, container_state = (
+            (match[1], int(match[2]), match[3]) if match else (None, None, "unavailable")
+        )
+        digest = None
+        if image_id:
+            image = subprocess.run(
+                ["podman", "image", "inspect", "--format", "{{.Digest}}", image_id],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            if not image.returncode and re.fullmatch(r"sha256:[0-9a-f]{64}", image.stdout.strip()):
+                digest = image.stdout.strip()
+        failed = []
+        for name in r.depends_on:
+            if name not in states:
+                states[name] = readiness(resources[name])
+            dependency = resources[name]
+            expected = (
+                "healthy"
+                if isinstance(dependency, ServiceSpec) and dependency.health
+                else "running"
+            )
+            if states[name] != expected:
+                failed.append(name)
         rows.append(
             {
                 "name": r.name,
@@ -179,8 +235,13 @@ def status_rows(inventory: Inventory, member: str | None, service: str | None) -
                 "active": unit.return_code == 0,
                 "readiness": readiness(r),
                 "dependencies": list(r.depends_on),
+                "failed_dependencies": failed,
                 "image": r.image.repository + ":" + r.image.tag,
                 "digest": r.image.digest,
+                "running_image_id": image_id,
+                "running_image_digest": digest,
+                "restart_count": restart_count,
+                "container_state": container_state,
             }
         )
     return rows

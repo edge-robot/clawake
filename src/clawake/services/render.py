@@ -84,16 +84,22 @@ def render_inventory(inventory: Inventory, output_dir: Path, template_root: Path
 
 def quadlet_word(value: str) -> str:
     """systemd word quoting, preserving literal arguments without shell expansion."""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+    return (
+        '"'
+        + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+        + '"'
+    )
 
 
 def render_service_assets(service: ServiceSpec) -> dict[str, str]:
-    lines = [
-        "[Unit]",
-        f"Description=Clawake service {service.name}",
-        "After=network-online.target",
-        "Wants=network-online.target",
-    ]
+    lines = (
+        []
+        if service.quadlet_default_dependencies
+        else ["[Quadlet]", "DefaultDependencies=false", ""]
+    )
+    lines += ["[Unit]", f"Description=Clawake service {service.name}"]
+    if service.quadlet_default_dependencies:
+        lines += ["After=network-online.target", "Wants=network-online.target"]
     for dependency in sorted(service.depends_on):
         lines += [f"After={dependency}.service", f"Requires={dependency}.service"]
     lines += [
@@ -117,8 +123,11 @@ def render_service_assets(service: ServiceSpec) -> dict[str, str]:
             + (":ro" if volume.read_only else "")
         )
     for secret in service.secrets:
+        ownership = f",uid={secret.uid}" if secret.uid is not None else ""
+        ownership += f",gid={secret.gid}" if secret.gid is not None else ""
         lines.append(
-            f"Secret={secret.name},type=mount,target={secret.target or secret.name},mode=0400"
+            f"Secret={secret.name},type=mount,target={secret.target or secret.name}"
+            f",mode=0400{ownership}"
         )
     for port in service.ports:
         address = f"[{port.bind_address}]" if ":" in port.bind_address else port.bind_address

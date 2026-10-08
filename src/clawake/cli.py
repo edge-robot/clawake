@@ -856,6 +856,35 @@ def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) ->
     )
 
 
+@app.command("upgrade-service")
+def service_upgrade(
+    config: ConfigPath,
+    service_name: Annotated[str, typer.Option(..., "--service", "-s")],
+    tag: TargetTag,
+    digest: Annotated[str, typer.Option(..., "--digest")],
+    execute: ExecuteFlag = False,
+    with_dependents: Annotated[bool, typer.Option("--with-dependents")] = False,
+) -> None:
+    """Preview a pinned generic service upgrade with consistent private backups."""
+    from clawake.services.service_upgrade import upgrade_service
+
+    try:
+        for entry in upgrade_service(
+            config,
+            service_name,
+            tag,
+            digest,
+            _template_root(),
+            execute=execute,
+            include_dependents=with_dependents,
+        ):
+            typer.echo(entry)
+        if not execute:
+            typer.echo("DRY RUN; re-run with --execute to apply")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 @app.command("logs")
 def member_logs(
     config: ConfigPath,
@@ -898,12 +927,30 @@ def _v2_operation(inventory, action, member, service_name, execute=False, format
                         f"{row['name']}: active={row['active']} readiness={row['readiness']}"
                     )
             if any(
-                not row["active"] or row["readiness"] not in {"healthy", "running"} for row in rows
+                not row["active"]
+                or row["readiness"] not in {"healthy", "running"}
+                or row["failed_dependencies"]
+                for row in rows
             ):
                 raise typer.Exit(1)
         else:
+
+            def prepare_instances(instances):
+                _check_a2a_environment(instances, inventory)
+                roots = {h.name: Path(h.quadlet_root) for h in inventory.hosts}
+                if not _retire_legacy_services(
+                    SystemdService(), instances, disable=action == "setup", quadlet_roots=roots
+                ):
+                    raise ValueError("Cannot retire legacy members")
+
             for entry in lifecycle(
-                inventory, action, member, service_name, _template_root(), execute=execute
+                inventory,
+                action,
+                member,
+                service_name,
+                _template_root(),
+                execute=execute,
+                prepare_instances=prepare_instances,
             ):
                 typer.echo(entry)
             if not execute:

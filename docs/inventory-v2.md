@@ -1,24 +1,28 @@
 # Inventory v2: model and validation boundary
 
-This first increment adds **offline validation only**. Version 1 remains deployable
-with its existing behavior. Version 2 may contain instances, services, or both;
-`clawake validate -c team.yml` validates the entire inventory without contacting
-Podman, reading secret values, rendering files or creating directories.
+Version 1 retains its established runtime behavior. Version 2 supports instances,
+services or both, deterministic combined plans, dependency-ordered setup/restart,
+persistence-safe teardown and resource status/logs. `validate` stays entirely
+offline: it does not render files, contact Podman or inspect secret values.
 
-V2 rendering, deployment and lifecycle are deliberately blocked until the next
-increments implement them. A valid model does not mean the service can be deployed.
+Setup/restart previews have no side effects. `--execute` checks referenced secret
+names and declared service inputs, applies a drift-checked plan and reloads once.
+HTTP readiness comes from the container health check (the image must provide curl).
+TLS verification remains enabled; privately issued certificates need an explicit
+CA trust mount/environment configuration. A failing dependency blocks its consumers.
 
-## Implementation increments
+Generic `upgrade-service --service NAME --to TAG --digest SHA256` previews a pinned
+upgrade and private backups. Writable bind paths must be in the backup policy;
+named volumes are exported. `--with-dependents` explicitly includes dependent
+resources in the maintenance plan. Execution stops them in reverse dependency
+order, backs up data, updates only the selected image mapping and reconciles the
+ordered selection. Backup failure or inventory drift halts the upgrade. No
+OpenClaw doctor or application-specific provider behavior is invoked. Backups are
+retained; deletion/retention is a separate operation.
 
-1. Models and validation (this increment): v2 resources, references, namespaces,
-   storage, ports, secrets, health declarations and an acyclic dependency graph.
-2. Deterministic rendering and combined deployment planning.
-3. Service selectors, dependency-ordered lifecycle and generic upgrades.
-4. Readiness/status/log reporting and a runnable example.
-
-Managed TLS provisioning and MCP service bindings are separate follow-on work.
-Unsupported `tls` and `service_bindings` fields are rejected rather than accepted
-as silently ineffective settings.
+Full generic managed TLS/CA distribution, service bindings and dashboard integration
+remain separate work. Unsupported `tls` and `service_bindings` fields still fail
+rather than becoming silently ineffective settings.
 
 ## Service shape
 
@@ -84,12 +88,13 @@ neither in the inventory nor in environment files.
   model. Nested targets are allowed; identical targets are not.
 - Environment files and backup paths are validated as paths without reading them.
 - Secrets reference existing Podman secret names, with an optional target basename
-  below `/run/secrets`. Duplicate names/targets and shadowing mounts fail. There is
+  below `/run/secrets`; optional numeric uid/gid control ownership and the renderer
+  uses mode 0400. Duplicate names/targets and shadowing mounts fail. There is
   no second top-level secret catalog and no secret value field.
 - Parsing checks secret syntax, not the host's secret store. The pure
   `validate_secret_references(available_names)` preflight accepts a host-supplied
   set of names and rejects missing references without inspecting values. Runtime
-  discovery belongs to the lifecycle increment.
+  discovery uses `podman secret ls` names only during executed setup/restart.
 - Port collision checks cover instances and services together, wildcard and mapped
   IPv6 addresses, and distinguish TCP from UDP. Unpublished internal health ports
   are valid; reachability is a future runtime check.
@@ -101,3 +106,29 @@ neither in the inventory nor in environment files.
 The validation module remains provider-neutral and imports no runtime clients.
 Tests use local fixtures and mocked side effects; the existing Quadlet-generator
 test is a dry run and starts no containers.
+
+
+## Operation examples
+
+```bash
+clawake setup -c team.yml --service example-api
+clawake setup -c team.yml --service example-api --execute
+clawake status -c team.yml --service example-api --format json
+clawake logs -c team.yml --service example-api -n 100
+clawake restart -c team.yml --service example-api --execute
+clawake teardown -c team.yml --service example-api --execute
+```
+
+`--member` and `--service` are mutually exclusive. Omitting both selects the whole
+team for lifecycle/status; logs require exactly one resource. Setup/restart includes
+transitive dependencies; teardown rejects dependencies used by unselected resources.
+Podman volumes and bind data survive teardown. Shared network definitions survive
+while unselected resources still use them. Services may set
+quadlet_default_dependencies: false on hosts that cannot supply user network-online;
+explicit resource ordering remains active.
+
+Status reads only selected safe Podman fields: unit state, container state,
+configured image/digest, running image ID/digest, restart count, health/readiness and
+failed dependencies. It never prints full inspect output, environment or health logs.
+Onboard/dashboard/plugin-sync and the original member upgrade remain v1-only;
+service upgrades use the explicit generic command above.

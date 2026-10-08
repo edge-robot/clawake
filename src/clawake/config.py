@@ -219,6 +219,8 @@ class VolumeSpec(BaseModel):
 
 
 class SecretRef(BaseModel):
+    uid: int | None = Field(default=None, ge=0, le=2147483647)
+    gid: int | None = Field(default=None, ge=0, le=2147483647)
     name: ResourceName
     target: ResourceName | None = None
 
@@ -245,6 +247,7 @@ class ServiceBackupPolicy(BackupPolicy):
 
 
 class ServiceSpec(BaseModel):
+    quadlet_default_dependencies: bool = True
     name: ResourceName
     host: ResourceName
     image: ServiceImageSpec

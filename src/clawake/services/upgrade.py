@@ -41,12 +41,14 @@ def _format_image_value(key: str, value: str) -> str:
     return json.dumps(value) if key.endswith("tag") else value
 
 
-def _update_image_fields(config_path: Path, instance_name: str, updates: dict[str, str]) -> None:
+def _update_image_fields(
+    config_path: Path, instance_name: str, updates: dict[str, str], *, section: str = "instances"
+) -> None:
     """Update one image mapping without reformatting the rest of the YAML document."""
     raw = config_path.read_text(encoding="utf-8")
     lines = raw.splitlines(keepends=True)
     document = yaml.compose(raw)
-    instances = next(value for key, value in document.value if key.value == "instances")
+    instances = next(value for key, value in document.value if key.value == section)
     selected = next(
         (
             node
@@ -73,7 +75,8 @@ def _update_image_fields(config_path: Path, instance_name: str, updates: dict[st
     ):
         raise ValueError("Shared YAML image aliases must be expanded before upgrade")
     if image_node.flow_style:
-        image = dict(_find_instance(yaml.safe_load(raw), instance_name)["image"])
+        data = yaml.safe_load(raw)
+        image = dict(next(item for item in data[section] if item["name"] == instance_name)["image"])
         image.update(updates)
         replacement = yaml.safe_dump(image, default_flow_style=True, sort_keys=False).strip()
         config_path.write_text(
