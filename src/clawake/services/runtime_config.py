@@ -36,6 +36,8 @@ def desired_fields(inventory: Inventory, instance: InstanceSpec) -> dict:
     if settings is None:
         return {}
     desired = {f"agents/entries/{settings.lead_agent_id}/workspace": "/workspace"}
+    for name, server in settings.mcp_servers.items():
+        desired[f"mcp/servers/{name}"] = server.runtime_config()
     if settings.subagents:
         spec = settings.subagents
         desired.update(
@@ -117,6 +119,8 @@ def plan_runtime_files(
         assert parent is not None
         node, key = parent
         existing = node.get(key, _MISSING)
+        if path in old_fields and existing is not _MISSING and existing != old_fields[path]:
+            raise ValueError(f"Managed field changed outside Clawake: {path}")
         if path not in old_fields and existing is not _MISSING and existing != value:
             raise ValueError(f"Refusing to overwrite unmanaged OpenClaw field: {path}")
         node[key] = value
