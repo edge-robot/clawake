@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from clawake.config import PluginSpec, load_inventory
@@ -263,3 +264,25 @@ def test_preserves_unmanaged_agent_tool_grants_during_reconciliation(tmp_path: P
         "operator_tool",
         "replacement_tool",
     ]
+
+
+@pytest.mark.parametrize("key", ["allow", "alsoAllow"])
+def test_preexisting_grant_is_not_claimed_by_inventory(tmp_path: Path, key: str) -> None:
+    instance = _instance(tmp_path)
+    config_path = Path(instance.workspace_path) / ".openclaw" / "openclaw.json"
+    config_path.parent.mkdir(parents=True)
+    payload = {
+        "agents": {
+            "entries": {
+                "main": {"tools": {key: ["cad_tool", "operator_tool"], "deny": ["forbidden_tool"]}}
+            }
+        }
+    }
+    config_path.write_text(json.dumps(payload))
+    instance.agent_tool_allow = {"main": ["cad_tool", "inventory_tool"]}
+    ensure_plugin_runtime_config(instance)
+    ensure_plugin_runtime_config(instance)
+    instance.agent_tool_allow = {}
+    ensure_plugin_runtime_config(instance)
+    tools = json.loads(config_path.read_text())["agents"]["entries"]["main"]["tools"]
+    assert tools == {key: ["cad_tool", "operator_tool"], "deny": ["forbidden_tool"]}

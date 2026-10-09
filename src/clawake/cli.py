@@ -103,10 +103,6 @@ def sync_plugins(
     inventory = _load(config, validation_only=True)
     selected = _select_instances(inventory, member)
     declared = [(instance, plugin) for instance in selected for plugin in instance.plugins]
-    if not declared:
-        typer.echo("No managed plugins declared for the selected member(s).")
-        return
-
     typer.echo(f"Plugin sync plan for {len(declared)} pinned plugin(s)")
     plans = []
     try:
@@ -157,12 +153,14 @@ def sync_plugins(
             config_path, config_changed = ensure_plugin_runtime_config(instance)
             if config_changed:
                 typer.echo(f"Updated managed plugin config and agent ACLs in {config_path}")
-            restart_instances[instance.name] = instance
+                restart_instances[instance.name] = instance
         except (OSError, RuntimeError, ValueError) as exc:
             typer.echo(str(exc), err=True)
             failed = True
             failed_instances.add(instance.name)
     for instance in restart_instances.values():
+        if instance.name in failed_instances:
+            continue
         restart_result = service.restart(instance.name, execute=True)
         _print_result(restart_result)
         failed = failed or restart_result.return_code != 0
