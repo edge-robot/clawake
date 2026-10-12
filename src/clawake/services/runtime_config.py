@@ -33,9 +33,15 @@ def _parent(payload: dict, path: str, *, create: bool) -> tuple[dict, str] | Non
 
 def desired_fields(inventory: Inventory, instance: InstanceSpec) -> dict:
     settings = instance.openclaw
+    mcp = {"mcp/servers/onshape": {
+        "transport": "streamable-http", "url": "http://clawonshape-mcp:8080/mcp",
+        "enabled": False, "requestTimeoutMs": 30000, "connectionTimeoutMs": 5000,
+        "supportsParallelToolCalls": False,
+    }} if instance.onshape_mcp else {}
     if settings is None:
-        return {}
+        return mcp
     desired = {f"agents/entries/{settings.lead_agent_id}/workspace": "/workspace"}
+    desired.update(mcp)
     if settings.subagents:
         spec = settings.subagents
         desired.update(
@@ -117,7 +123,14 @@ def plan_runtime_files(
         assert parent is not None
         node, key = parent
         existing = node.get(key, _MISSING)
-        if path not in old_fields and existing is not _MISSING and existing != value:
+        adopting_disabled_hosted_onshape = (
+            instance.onshape_mcp and path == "mcp/servers/onshape"
+            and isinstance(existing, dict)
+            and existing.get("url") == "https://fs-mcp.labs.onshape.app/mcp"
+            and existing.get("enabled") is False
+        )
+        if (path not in old_fields and existing is not _MISSING and existing != value
+                and not adopting_disabled_hosted_onshape):
             raise ValueError(f"Refusing to overwrite unmanaged OpenClaw field: {path}")
         node[key] = value
 

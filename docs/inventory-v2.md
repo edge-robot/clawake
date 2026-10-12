@@ -101,3 +101,14 @@ neither in the inventory nor in environment files.
 The validation module remains provider-neutral and imports no runtime clients.
 Tests use local fixtures and mocked side effects; the existing Quadlet-generator
 test is a dry run and starts no containers.
+
+## Focused Onshape MCP exception (2026-10-12)
+
+Generic v2 deployment is still unsupported. `clawake onshape-mcp --config service.yml
+--action plan|apply|status|restart [--execute]` operates a narrow private rootless
+external-token service using the existing artifact/systemd lifecycle. It requires
+an image digest, private credential_directory, config_file and quadlet_root;
+it never reads or renews tokens. `InstanceSpec.onshape_mcp: true` reconciles the
+known local native server in disabled state; activation/agent invocation still
+requires its separate supported authority boundary. See Claw-Onshape's
+self-hosted-mcp-architecture.md for the exact mode and credential contract.

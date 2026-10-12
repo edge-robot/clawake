@@ -854,5 +854,57 @@ app.command("onboard")(onboard_member)
 app.command("dashboard")(diagnose_dashboard)
 
 
+@app.command("onshape-mcp")
+def onshape_mcp(
+    config: ConfigPath,
+    action: Annotated[
+        Literal["plan", "apply", "status", "restart", "probe"], typer.Option("--action")
+    ] = "plan",
+    execute: ExecuteFlag = False,
+) -> None:
+    """Operate the isolated external-token MCP service; never handle OAuth tokens."""
+    from clawake.services.onshape_mcp import (
+        OnshapeMcpSpec,
+        plan_onshape_mcp,
+        probe_native,
+        validate_runtime_paths,
+    )
+    try:
+        spec = OnshapeMcpSpec.model_validate(yaml.safe_load(config.read_text()))
+    except (ValueError, OSError, yaml.YAMLError) as exc:
+        raise typer.BadParameter("Invalid Onshape MCP service specification") from exc
+    if action == "probe":
+        if execute:
+            try:
+                typer.echo(json.dumps(probe_native(spec)))
+            except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+                raise typer.BadParameter("Native local MCP discovery failed") from exc
+        else:
+            typer.echo("Native operator-only local MCP discovery; no agent grants or tool calls")
+        return
+    service = SystemdService()
+    if action in {"status", "restart"}:
+        result = (service.status(spec.name, execute=execute) if action == "status"
+                  else service.restart(spec.name, execute=execute))
+        typer.echo(" ".join(result.command))
+        if execute:
+            typer.echo(f"exit={result.return_code}")
+        if result.return_code:
+            raise typer.Exit(1)
+        return
+    changes = plan_onshape_mcp(spec)
+    for change in changes:
+        typer.echo(f"{change.member}: {change.destination}")
+    if action == "apply" and execute:
+        validate_runtime_paths(spec)
+        apply_artifacts(changes)
+        for operation in [lambda: service.daemon_reload(execute=True),
+                          lambda: service.restart(spec.name, execute=True)]:
+            result = operation()
+            if result.return_code:
+                raise typer.BadParameter("Onshape MCP service start failed; inspect systemd")
+        typer.echo("Onshape MCP service configured and started; credential readiness unverified")
+
+
 if __name__ == "__main__":
     app()

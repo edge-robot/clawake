@@ -350,6 +350,7 @@ class InstanceSpec(BaseModel):
     openclaw: OpenClawSpec | None = None
     mounts: list[MountSpec] = Field(default_factory=list)
     plugins: list[PluginSpec] = Field(default_factory=list)
+    onshape_mcp: bool = False
     agent_tool_allow: dict[str, list[str]] = Field(default_factory=dict)
     env_files: list[str] = Field(default_factory=list)
     dns_servers: list[str] = Field(default_factory=list)
