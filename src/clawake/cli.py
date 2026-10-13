@@ -115,6 +115,11 @@ def sync_plugins(
             else:
                 typer.echo(f"   npm: {plugin.npm_spec}")
         for instance in selected:
+            if instance.global_tool_allow:
+                typer.echo(
+                    f" - {instance.name}: explicit global tools "
+                    f"({', '.join(instance.global_tool_allow)})"
+                )
             for agent_id, tools in sorted(instance.agent_tool_allow.items()):
                 typer.echo(
                     f" - {instance.name}: agent {agent_id} optional tools ({', '.join(tools)})"

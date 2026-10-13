@@ -352,6 +352,7 @@ class InstanceSpec(BaseModel):
     plugins: list[PluginSpec] = Field(default_factory=list)
     onshape_mcp: bool = False
     agent_tool_allow: dict[str, list[str]] = Field(default_factory=dict)
+    global_tool_allow: list[str] = Field(default_factory=list)
     env_files: list[str] = Field(default_factory=list)
     dns_servers: list[str] = Field(default_factory=list)
     labels: dict[str, str] = Field(default_factory=dict)
@@ -371,6 +372,17 @@ class InstanceSpec(BaseModel):
             except ValueError as exc:
                 raise ValueError(f"DNS server must be an IPv4 or IPv6 address: '{value}'") from exc
         return values
+
+    @field_validator("global_tool_allow")
+    @classmethod
+    def validate_global_tool_allow(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("global_tool_allow must be unique")
+        if any(not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", tool) for tool in value):
+            raise ValueError(
+                "global_tool_allow requires explicit tool names without groups/wildcards"
+            )
+        return value
 
     @field_validator("agent_tool_allow")
     @classmethod

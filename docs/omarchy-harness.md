@@ -64,3 +64,37 @@ explains the diagnosed case and generator test.
 
 Recovery uses the same inventory and Clawake status/logs/restart/teardown previews;
 never replace it with manually maintained Quadlets or a second supervisor.
+
+For Discord attachments, the product-owned inventory must explicitly include
+`message` in `agent_tool_allow` for the named Lead agent:
+
+```yaml
+agent_tool_allow:
+  clawcad-robotics-lead:
+    - clawcad_delegate_render
+    - message
+```
+
+Clawake reconciles these grants into that agent's `tools.alsoAllow` when it has
+no explicit `tools.allow`. This matters after onboarding selects the `coding`
+profile: a global `tools.allow` containing `message` alone does not widen the
+profile. A Discord skill supplies instructions, not tool permissions. Keep the
+grant in the inventory generator as well, so regeneration preserves it. Global
+and provider allow/deny policies still apply; inspect the effective tool catalog
+for the named agent, including Control UI WebChat sessions.
+
+Review `sync-plugins -c <inventory> -m clawcad-robotics-lead`, then run it with
+`--execute` to reconcile the policy and restart the Lead gateway. Do not grant
+Discord delivery to the Engineer. The native message tool accepts `action: send`,
+`channel: discord`, `target: channel:<id>`, `message`, and `media`. Pass the
+renderer's `filePath` value as `media`; the installed agent tool schema does not
+expose a `filePath` parameter. Verify a real attachment
+upload separately; a local path or renderer checksum does not prove delivery.
+
+If the host already has a restrictive global `tools.allow`, an operator may add
+explicit names through the inventory's `global_tool_allow`. Clawake requires an
+existing nonempty allowlist, preserves its unmanaged entries and all deny/profile
+settings, and removes only the names it added when the grant is withdrawn. Groups,
+wildcards and duplicates are rejected; a withdrawal that would empty the global
+allowlist fails rather than widening the default policy. Agent grants still
+determine which named role can use the tool. Preview reconciliation before apply.

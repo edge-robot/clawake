@@ -168,6 +168,33 @@ def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
             experimental["customPlugins"] = True
             changed = True
 
+    # Explicit operator opt-in: agent alsoAllow cannot override a global allowlist.
+    # Own only newly added names, so withdrawing a managed grant preserves names
+    # that the operator already allowed before Clawake began managing it.
+    previous_global = state.get("globalToolAllow", [])
+    if not isinstance(previous_global, list) or not all(
+        isinstance(name, str) for name in previous_global
+    ):
+        raise ValueError(f"Clawake state '{state_path}': globalToolAllow must be a string array")
+    next_global: list[str] = []
+    if instance.global_tool_allow or previous_global:
+        global_tools = payload.get("tools")
+        existing = global_tools.get("allow") if isinstance(global_tools, dict) else None
+        if instance.global_tool_allow and (
+            not isinstance(existing, list) or not existing
+            or not all(isinstance(name, str) for name in existing)
+        ):
+            raise ValueError("global_tool_allow requires an existing non-empty tools.allow; "
+                             "Clawake will not replace default host policy")
+        if isinstance(existing, list) and all(isinstance(name, str) for name in existing):
+            unmanaged = [name for name in existing if name not in previous_global]
+            next_global = [name for name in instance.global_tool_allow if name not in unmanaged]
+            merged = list(dict.fromkeys([*unmanaged, *instance.global_tool_allow]))
+            if not merged and existing:
+                raise ValueError("Withdrawing global grants would empty tools.allow; "
+                                 "retain an explicit operator-owned allowlist")
+            global_tools["allow"] = merged
+
     previous_grants = state.get("agentToolAllow", {})
     if not isinstance(previous_grants, dict):
         raise ValueError(f"Clawake state '{state_path}': agentToolAllow must be an object")
@@ -232,7 +259,9 @@ def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
     changed = payload != original_payload
     if changed:
         _write_config(config_path, payload)
-    next_state: dict[str, object] = {"version": 1, "agentToolAllow": next_grants}
+    next_state: dict[str, object] = {
+        "version": 1, "agentToolAllow": next_grants, "globalToolAllow": next_global
+    }
     if state != next_state:
         _write_config(state_path, next_state)
     return config_path, changed
