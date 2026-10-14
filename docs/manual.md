@@ -213,3 +213,16 @@ altes Image mit bereits migrierten Daten ist kein verlässlicher Rollback.
 `teardown --execute` entfernt ausgewählte Container und Quadlets, bewahrt aber
 Workspace-Daten. Es ist weder ein Backup noch eine vollständige Löschung von
 Zugangsdaten oder personenbezogenen Informationen.
+
+## Getrennter OpenClaw-State
+
+`state_path` ist ein optionaler absoluter Hostpfad je Instanz. Ohne diesen Wert
+bleibt `workspace_path/.openclaw` der Standard. Mount, Konfigurationsverwaltung,
+Plugin-Ledger, Browser-Cache, Doctor/Upgrade und Backup verwenden denselben Pfad.
+Ein außerhalb des Workspace liegender State wird automatisch ins Backup
+aufgenommen. Das reguläre Backup meldet übersprungene unlesbare Dateien; für
+eine Migration ist ein vollständiges, geprüftes Offline-Backup erforderlich.
+
+`clawake stop -c INVENTAR [--member NAME]` zeigt die Vorschau; `--execute` hält
+die ausgewählten Dienste an und erhält Daten und Quadlets. Für den MCP-Dienst
+entsprechend `clawake onshape-mcp -c SERVICE --action stop [--execute]`.

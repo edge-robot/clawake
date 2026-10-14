@@ -54,7 +54,7 @@ def local_control_ui_origins(instance: InstanceSpec) -> list[str]:
 
 def ensure_workspace_config(instance: InstanceSpec) -> tuple[Path, bool]:
     """Make the workspace mounted by Clawake OpenClaw's default agent workspace."""
-    config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
+    config_path = instance.runtime_state_path / "openclaw.json"
     payload = _load_config(config_path)
 
     changed = configure_workspace(payload)
@@ -82,7 +82,7 @@ def configure_workspace(payload: dict[str, object]) -> bool:
 
 def ensure_control_ui_config(instance: InstanceSpec) -> tuple[Path, bool]:
     """Merge inferred local Control UI settings into OpenClaw's persisted config."""
-    config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
+    config_path = instance.runtime_state_path / "openclaw.json"
     payload = _load_config(config_path)
     changed = configure_control_ui(instance, payload)
     if changed:
@@ -123,7 +123,7 @@ def configure_control_ui(instance: InstanceSpec, payload: dict[str, object]) -> 
 
 def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
     """Atomically merge managed plugin settings and per-agent optional-tool grants."""
-    config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
+    config_path = instance.runtime_state_path / "openclaw.json"
     state_path = config_path.with_name(_PLUGIN_RUNTIME_STATE)
     payload = _load_config(config_path)
     original_payload = deepcopy(payload)

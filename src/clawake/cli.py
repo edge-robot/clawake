@@ -620,7 +620,7 @@ def setup_quadlets(
 
     # Podman requires bind-mount sources to exist before starting the unit.
     for instance in selected:
-        runtime_state = Path(instance.workspace_path).expanduser() / ".openclaw"
+        runtime_state = instance.runtime_state_path
         runtime_state.mkdir(parents=True, exist_ok=True)
         if is_browser_image(instance.image):
             ensure_browser_cache(instance)
@@ -646,6 +646,26 @@ def setup_quadlets(
 
     if failed:
         raise typer.Exit(code=1)
+
+
+@app.command("stop")
+def stop_members(
+    config: ConfigPath,
+    member: OptionalMemberName = None,
+    execute: ExecuteFlag = False,
+) -> None:
+    """Stop managed services without removing runtime data or Quadlets."""
+    selected = _select_instances(_load(config), member)
+    service = SystemdService()
+    failed = False
+    for instance in selected:
+        result = service.stop(instance.name, execute=execute)
+        _print_result(result)
+        failed = failed or result.return_code != 0
+    if failed:
+        raise typer.Exit(code=1)
+    if not execute:
+        typer.echo("DRY RUN stop complete. Re-run with --execute to mutate state.")
 
 
 @app.command("restart-quadlets")
@@ -863,7 +883,7 @@ app.command("dashboard")(diagnose_dashboard)
 def onshape_mcp(
     config: ConfigPath,
     action: Annotated[
-        Literal["plan", "apply", "status", "restart", "probe"], typer.Option("--action")
+        Literal["plan", "apply", "status", "restart", "stop", "probe"], typer.Option("--action")
     ] = "plan",
     execute: ExecuteFlag = False,
 ) -> None:
@@ -888,9 +908,9 @@ def onshape_mcp(
             typer.echo("Native operator-only local MCP discovery; no agent grants or tool calls")
         return
     service = SystemdService()
-    if action in {"status", "restart"}:
-        result = (service.status(spec.name, execute=execute) if action == "status"
-                  else service.restart(spec.name, execute=execute))
+    if action in {"status", "restart", "stop"}:
+        operation = {"status": service.status, "restart": service.restart, "stop": service.stop}
+        result = operation[action](spec.name, execute=execute)
         typer.echo(" ".join(result.command))
         if execute:
             typer.echo(f"exit={result.return_code}")

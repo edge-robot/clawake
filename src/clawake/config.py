@@ -339,6 +339,7 @@ class InstanceSpec(BaseModel):
     host: str
     role: Literal["product_owner", "developer"]
     workspace_path: str
+    state_path: str | None = None
     team_definition_path: str
     service_scope: Literal["user"] = "user"
     quadlet_path: str
@@ -351,6 +352,7 @@ class InstanceSpec(BaseModel):
     mounts: list[MountSpec] = Field(default_factory=list)
     plugins: list[PluginSpec] = Field(default_factory=list)
     onshape_mcp: bool = False
+    onshape_mcp_enabled: bool = False
     agent_tool_allow: dict[str, list[str]] = Field(default_factory=dict)
     global_tool_allow: list[str] = Field(default_factory=list)
     env_files: list[str] = Field(default_factory=list)
@@ -362,6 +364,17 @@ class InstanceSpec(BaseModel):
     backup_policy: BackupPolicy = Field(default_factory=BackupPolicy)
     gateway_runtime: GatewayRuntimeSpec = Field(default_factory=GatewayRuntimeSpec)
     dashboard: DashboardMeta
+
+    @field_validator("state_path")
+    @classmethod
+    def validate_state_path(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not Path(value).is_absolute()
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            or ":" in value
+        ):
+            raise ValueError("state_path must be an absolute, safe host path")
+        return value
 
     @field_validator("dns_servers")
     @classmethod
@@ -412,6 +425,8 @@ class InstanceSpec(BaseModel):
 
     @model_validator(mode="after")
     def ensure_backup_defaults(self) -> InstanceSpec:
+        if self.onshape_mcp_enabled and not self.onshape_mcp:
+            raise ValueError("onshape_mcp_enabled requires the managed onshape_mcp connector")
         if self.name in self.legacy_names:
             raise ValueError(f"instances[{self.name}].legacy_names must not include its name")
         quadlet = Path(self.quadlet_path)
@@ -426,6 +441,13 @@ class InstanceSpec(BaseModel):
                 self.team_definition_path,
             ]
         return self
+
+    @property
+    def runtime_state_path(self) -> Path:
+        """One authoritative host path for persisted OpenClaw runtime data."""
+        if self.state_path is not None:
+            return Path(self.state_path).expanduser()
+        return Path(self.workspace_path).expanduser() / ".openclaw"
 
     @property
     def network_quadlet_path(self) -> str:
@@ -572,6 +594,10 @@ class Inventory(BaseModel):
                 f"instances[{instance.name}].team_definition_path",
                 instance.team_definition_path,
             )
+            if instance.state_path is not None:
+                _validate_safe_absolute_path(
+                    f"instances[{instance.name}].state_path", instance.state_path
+                )
             for env_file in instance.env_files:
                 _validate_safe_absolute_path(
                     f"instances[{instance.name}].env_files",
@@ -634,6 +660,7 @@ class Inventory(BaseModel):
 
             storage_paths = {
                 "workspace_path": instance.workspace_path,
+                "state_path": str(instance.runtime_state_path),
                 "team_definition_path": instance.team_definition_path,
             }
             for boundary, raw_path in storage_paths.items():

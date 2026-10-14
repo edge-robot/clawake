@@ -110,6 +110,14 @@ Exit codes: `0` for success (including previews), `1` for operational failure,
 `2` for invalid CLI arguments or inventory. JSON status is emitted on stdout and
 remains available when an unhealthy service causes exit code `1`.
 
+For the existing self-hosted Onshape connector, `onshape_mcp: true` creates the
+local native MCP declaration with access disabled by default. An explicit
+`onshape_mcp_enabled: true` enables it with a finite four-tool filter (auth status,
+API explanation, schema and API call). Review and apply through `setup`; reconcile
+the named agent's explicit grants through `sync-plugins`. This setting grants no
+CAD write authority: the independently pinned MCP server still enforces its target
+and operation policy. Enabling requires `onshape_mcp: true`.
+
 Compatibility names: `setup-quadlets`, `restart-quadlets`, `status-quadlets`,
 `teardown-quadlets`, `onboard-member`, `diagnose-dashboard`.
 
@@ -156,3 +164,17 @@ Tests exercise rendering, validation and lifecycle operations with temporary fil
 and simulated runtime adapters. They do not require deploying a live team.
 
 For fresh Omarchy source workspaces, use the [harness bootstrap guide](docs/omarchy-harness.md) and repo-scoped `clawake-harness` Codex skill.
+
+### Separate workspace and runtime state
+
+An instance may set `state_path` to an absolute host directory. All runtime
+configuration, plugin ownership ledgers, browser caches, doctor/upgrade mounts
+and backups use that directory. The default remains `workspace_path/.openclaw`.
+The container paths remain `/workspace` and `/home/node/.openclaw`. Configure
+separate state directories per instance; keep credentials, sessions and state
+out of version control. Migration copies the entire offline state before setup.
+
+`clawake stop -c INVENTORY` previews stopping only selected managed agents; add
+`--execute` to stop them without deleting Quadlets or state. Use `--member` for
+one agent. The external-token service supports `onshape-mcp --action stop` with
+the same preview/apply convention. Resume with managed setup/restart.

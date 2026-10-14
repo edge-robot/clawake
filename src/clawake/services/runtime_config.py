@@ -33,11 +33,34 @@ def _parent(payload: dict, path: str, *, create: bool) -> tuple[dict, str] | Non
 
 def desired_fields(inventory: Inventory, instance: InstanceSpec) -> dict:
     settings = instance.openclaw
-    mcp = {"mcp/servers/onshape": {
-        "transport": "streamable-http", "url": "http://clawonshape-mcp:8080/mcp",
-        "enabled": False, "requestTimeoutMs": 30000, "connectionTimeoutMs": 5000,
-        "supportsParallelToolCalls": False,
-    }} if instance.onshape_mcp else {}
+    mcp = (
+        {
+            "mcp/servers/onshape": {
+                "transport": "streamable-http",
+                "url": "http://clawonshape-mcp:8080/mcp",
+                "enabled": instance.onshape_mcp_enabled,
+                "requestTimeoutMs": 30000,
+                "connectionTimeoutMs": 5000,
+                "supportsParallelToolCalls": False,
+                **(
+                    {
+                        "toolFilter": {
+                            "include": [
+                                "onshape_auth_status",
+                                "onshape_api_explain",
+                                "onshape_api_schema",
+                                "onshape_api_call",
+                            ]
+                        }
+                    }
+                    if instance.onshape_mcp_enabled
+                    else {}
+                ),
+            }
+        }
+        if instance.onshape_mcp
+        else {}
+    )
     if settings is None:
         return mcp
     desired = {f"agents/entries/{settings.lead_agent_id}/workspace": "/workspace"}
@@ -99,7 +122,7 @@ def plan_runtime_files(
     instance: InstanceSpec,
 ) -> list[tuple[Path, str, str | None, tuple[str, ...]]]:
     """Return planned files and changed keys without writes or secret expansion."""
-    root = Path(instance.workspace_path).expanduser() / ".openclaw"
+    root = instance.runtime_state_path
     config_path = root / "openclaw.json"
     state_path = root / STATE_FILE
     payload, previous = _read_object(config_path)
@@ -124,13 +147,18 @@ def plan_runtime_files(
         node, key = parent
         existing = node.get(key, _MISSING)
         adopting_disabled_hosted_onshape = (
-            instance.onshape_mcp and path == "mcp/servers/onshape"
+            instance.onshape_mcp
+            and path == "mcp/servers/onshape"
             and isinstance(existing, dict)
             and existing.get("url") == "https://fs-mcp.labs.onshape.app/mcp"
             and existing.get("enabled") is False
         )
-        if (path not in old_fields and existing is not _MISSING and existing != value
-                and not adopting_disabled_hosted_onshape):
+        if (
+            path not in old_fields
+            and existing is not _MISSING
+            and existing != value
+            and not adopting_disabled_hosted_onshape
+        ):
             raise ValueError(f"Refusing to overwrite unmanaged OpenClaw field: {path}")
         node[key] = value
 

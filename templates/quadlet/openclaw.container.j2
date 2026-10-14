@@ -25,7 +25,7 @@ EnvironmentFile={{ env_file }}
 {% endfor %}
 Volume={{ instance.workspace_path }}:/workspace
 Volume={{ instance.team_definition_path }}:/team-definition:ro
-Volume={{ instance.workspace_path }}/.openclaw:/home/node/.openclaw
+Volume={{ instance.runtime_state_path }}:/home/node/.openclaw
 {% if instance.networks %}
 {% for name in instance.networks %}
 Network={{ name }}.network

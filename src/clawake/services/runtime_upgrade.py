@@ -34,7 +34,7 @@ def is_browser_image(image: ImageSpec) -> bool:
 
 
 def browser_cache_path(instance: InstanceSpec) -> Path:
-    return Path(instance.workspace_path) / ".openclaw" / "cache" / "openclaw-1000"
+    return instance.runtime_state_path / "cache" / "openclaw-1000"
 
 
 def ensure_browser_cache(instance: InstanceSpec) -> Path:
@@ -59,7 +59,7 @@ def doctor_command(instance: InstanceSpec, image: ImageSpec) -> list[str]:
             "--volume",
             f"{instance.workspace_path}:/workspace",
             "--volume",
-            f"{instance.workspace_path}/.openclaw:/home/node/.openclaw",
+            f"{instance.runtime_state_path}:/home/node/.openclaw",
             "--volume",
             f"{instance.team_definition_path}:/team-definition:ro",
         ]

@@ -15,6 +15,9 @@ def backup_sources(instance: InstanceSpec) -> list[Path]:
         Path(instance.workspace_path).expanduser(),
         Path(instance.team_definition_path).expanduser(),
     ]
+    workspace = Path(instance.workspace_path).expanduser()
+    if not instance.runtime_state_path.is_relative_to(workspace):
+        ordered.append(instance.runtime_state_path)
     ordered.extend(Path(path).expanduser() for path in instance.backup_policy.paths)
 
     unique: list[Path] = []

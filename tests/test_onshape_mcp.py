@@ -88,6 +88,31 @@ def test_native_registry_reconciliation_keeps_agent_mcp_disabled():
     assert "toolFilter" not in entry
 
 
+def test_explicit_native_read_enable_retains_exact_connector_and_finite_catalog():
+    from clawake.config import InstanceSpec, load_inventory
+    from clawake.services.runtime_config import desired_fields
+
+    inventory = load_inventory(Path(__file__).resolve().parents[1] / "examples/staff/team.yml")
+    member = inventory.instances[0].model_copy(deep=True)
+    member.onshape_mcp = True
+    member.onshape_mcp_enabled = True
+    entry = desired_fields(inventory, member)["mcp/servers/onshape"]
+    assert entry["enabled"] is True
+    assert entry["url"] == "http://clawonshape-mcp:8080/mcp"
+    assert entry["supportsParallelToolCalls"] is False
+    assert set(entry["toolFilter"]["include"]) == {
+        "onshape_auth_status",
+        "onshape_api_explain",
+        "onshape_api_schema",
+        "onshape_api_call",
+    }
+    assert "auth" not in entry and "headers" not in entry
+    invalid = member.model_dump()
+    invalid["onshape_mcp"] = False
+    with pytest.raises(ValidationError, match="requires the managed onshape_mcp connector"):
+        InstanceSpec.model_validate(invalid)
+
+
 def test_native_probe_uses_top_level_catalog_and_rejects_diagnostics(tmp_path, monkeypatch):
     import json
     import subprocess

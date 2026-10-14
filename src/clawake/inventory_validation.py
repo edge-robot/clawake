@@ -180,6 +180,8 @@ def validate_v2_inventory(inventory: Inventory) -> None:
         if Path(instance.quadlet_path).stem != instance.name:
             raise ValueError("V2 instance name must match its Quadlet filename stem")
         instance.workspace_path = host_path(instance.workspace_path)
+        if instance.state_path is not None:
+            instance.state_path = host_path(instance.state_path)
         instance.team_definition_path = host_path(instance.team_definition_path)
         instance.env_files = [host_path(path) for path in instance.env_files]
         instance.backup_policy.paths = [host_path(path) for path in instance.backup_policy.paths]

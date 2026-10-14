@@ -98,3 +98,14 @@ settings, and removes only the names it added when the grant is withdrawn. Group
 wildcards and duplicates are rejected; a withdrawal that would empty the global
 allowlist fails rather than widening the default policy. Agent grants still
 determine which named role can use the tool. Preview reconciliation before apply.
+
+## Separate persisted state
+
+An instance can set an absolute `state_path`. Clawake uses it consistently for
+OpenClaw mounts, configuration, plugin ledgers, cache, backups and upgrade Doctor.
+Existing inventories still default to `workspace_path/.openclaw`. Before moving
+paths, stop only selected managed services, take and verify a complete private
+backup, and copy all native state offline. Preview setup against the copied state
+before applying. `clawake stop -c INVENTORY [--member NAME]` previews service stops;
+`--execute` applies without removing definitions/data. MCP uses its existing
+`onshape-mcp --action stop` lifecycle. Preserve agent identities during migration.

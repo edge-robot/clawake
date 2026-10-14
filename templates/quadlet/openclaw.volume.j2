@@ -11,7 +11,7 @@ VolumeName={{ instance.container_name }}-state
 Driver=local
 Options=type=none
 Options=o=bind
-Options=device={{ instance.workspace_path }}/.openclaw
+Options=device={{ instance.runtime_state_path }}
 
 [Install]
 WantedBy=default.target
