@@ -1,0 +1,15 @@
+[Quadlet]
+DefaultDependencies=false
+
+[Unit]
+Description=OpenClaw runtime state volume example-engineer
+
+[Volume]
+VolumeName=example-engineer-state
+Driver=local
+Options=type=none
+Options=o=bind
+Options=device=/srv/example/engineer/state
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "fields": {
+    "agents/entries/example-lead/workspace": "/workspace",
+    "channels/a2a/enabled": true,
+    "plugins/entries/a2a/enabled": true,
+    "channels/a2a/exposeAgents": [
+      "example-lead"
+    ],
+    "channels/a2a/peers/engineer": {
+      "token": "${EXAMPLE_ENGINEER_TO_LEAD}",
+      "outboundToken": "${EXAMPLE_LEAD_TO_ENGINEER}",
+      "url": "http://example-engineer:18789/a2a/v1"
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "example-lead",
+      "match": {
+        "channel": "a2a"
+      }
+    }
+  ]
+}

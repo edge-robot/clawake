@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "agentToolAllow": {
+    "example-lead": {
+      "key": "alsoAllow",
+      "tools": [
+        "message",
+        "cad_delegate_render",
+        "cad_delegate_task"
+      ]
+    }
+  },
+  "globalToolAllow": [
+    "cad_delegate_render",
+    "cad_delegate_task"
+  ]
+}

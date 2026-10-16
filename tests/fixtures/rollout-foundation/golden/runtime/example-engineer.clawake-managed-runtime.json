@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "fields": {
+    "agents/entries/example-engineer/workspace": "/workspace",
+    "mcp/servers/onshape": {
+      "transport": "streamable-http",
+      "url": "http://clawonshape-mcp:8080/mcp",
+      "enabled": true,
+      "requestTimeoutMs": 30000,
+      "connectionTimeoutMs": 5000,
+      "supportsParallelToolCalls": false,
+      "toolFilter": {
+        "include": [
+          "onshape_auth_status",
+          "onshape_api_explain",
+          "onshape_api_schema",
+          "onshape_api_call"
+        ]
+      }
+    },
+    "channels/a2a/enabled": true,
+    "plugins/entries/a2a/enabled": true,
+    "channels/a2a/exposeAgents": [
+      "example-engineer"
+    ],
+    "channels/a2a/peers/lead": {
+      "token": "${EXAMPLE_LEAD_TO_ENGINEER}",
+      "outboundToken": "${EXAMPLE_ENGINEER_TO_LEAD}",
+      "url": "http://example-lead:18789/a2a/v1"
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "example-engineer",
+      "match": {
+        "channel": "a2a"
+      }
+    }
+  ]
+}

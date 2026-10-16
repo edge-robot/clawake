@@ -1,0 +1,13 @@
+{
+  "agents/entries/example-lead/workspace": "/workspace",
+  "channels/a2a/enabled": true,
+  "channels/a2a/exposeAgents": [
+    "example-lead"
+  ],
+  "channels/a2a/peers/engineer": {
+    "outboundToken": "${EXAMPLE_LEAD_TO_ENGINEER}",
+    "token": "${EXAMPLE_ENGINEER_TO_LEAD}",
+    "url": "http://example-engineer:18789/a2a/v1"
+  },
+  "plugins/entries/a2a/enabled": true
+}

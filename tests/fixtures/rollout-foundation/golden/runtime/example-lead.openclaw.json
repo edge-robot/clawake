@@ -1,0 +1,50 @@
+{
+  "agents": {
+    "entries": {
+      "example-lead": {
+        "workspace": "/workspace"
+      }
+    },
+    "defaults": {
+      "workspace": "/workspace"
+    }
+  },
+  "channels": {
+    "a2a": {
+      "enabled": true,
+      "exposeAgents": [
+        "example-lead"
+      ],
+      "peers": {
+        "engineer": {
+          "token": "${EXAMPLE_ENGINEER_TO_LEAD}",
+          "outboundToken": "${EXAMPLE_LEAD_TO_ENGINEER}",
+          "url": "http://example-engineer:18789/a2a/v1"
+        }
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "a2a": {
+        "enabled": true
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "example-lead",
+      "match": {
+        "channel": "a2a"
+      }
+    }
+  ],
+  "gateway": {
+    "controlUi": {
+      "allowedOrigins": [
+        "http://127.0.0.1:19001",
+        "http://localhost:19001"
+      ]
+    }
+  }
+}

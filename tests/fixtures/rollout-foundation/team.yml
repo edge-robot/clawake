@@ -1,0 +1,170 @@
+# Synthetic inventory that mirrors the shape of a deployed two-member Onshape team.
+# Every name, ID, digest and path is fake; nothing here describes a real host.
+version: 1
+cluster:
+  name: example-cad
+  primary_host: example-host
+hosts:
+  - name: example-host
+networks:
+  - name: example-team
+    host: example-host
+    quadlet_default_dependencies: false
+  - name: example-mcp-private
+    host: example-host
+    quadlet_default_dependencies: false
+instances:
+  - name: example-lead
+    host: example-host
+    role: product_owner
+    workspace_path: /srv/example/lead/workspace
+    state_path: /srv/example/lead/state
+    team_definition_path: /srv/example/roles/lead
+    quadlet_path: example-lead.container
+    container_name: example-lead
+    networks: [example-team]
+    image:
+      repository: ghcr.io/example/openclaw
+      tag: "2026.1.1"
+      digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      known_good_tag: "2026.1.0"
+      known_good_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    ports:
+      - {bind_address: 127.0.0.1, host_port: 19001, container_port: 18789}
+    env_files: [/srv/example/env/lead.env]
+    gateway_runtime: {enabled: true, bind: lan}
+    dashboard: {friendly_name: Example Lead, owner: example}
+    openclaw:
+      lead_agent_id: example-lead
+      a2a:
+        enabled: true
+        peers:
+          engineer:
+            instance: example-engineer
+            inbound_token_env: EXAMPLE_ENGINEER_TO_LEAD
+            outbound_token_env: EXAMPLE_LEAD_TO_ENGINEER
+    mounts:
+      - {source: /srv/example/shared/briefs, target: /mnt/briefs, read_only: true}
+      - {source: /srv/example/shared/keys, target: /mnt/keys, read_only: true}
+    quadlet_default_dependencies: false
+    agent_tool_allow:
+      example-lead: [message, cad_delegate_render, cad_delegate_task]
+    plugins:
+      - id: example-cad
+        artifact_path: /srv/example/packages/example-cad-0.0.1.tgz
+        sha256: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+        config:
+          bindings:
+            - agentId: example-lead
+              requesterSenderId: "000000000000000001"
+              messageChannel: discord
+              agentAccountId: example-lead
+              discordChannelId: "000000000000000002"
+              connectionRef: example-connection
+              documentId: "000000000000000000000001"
+              primaryWorkspaceId: "000000000000000000000002"
+              workspaceId: "000000000000000000000002"
+              elementId: "000000000000000000000003"
+          liveReads: false
+          engineerAgentId: example-engineer
+          delegation:
+            leadAgentId: example-lead
+            engineerAgentId: example-engineer
+            peerSenderId: "000000000000000003"
+            accountId: example-lead
+            keyFile: /mnt/keys/delegation.key
+        enabled: true
+        custom_ui: false
+    global_tool_allow: [cad_delegate_render, cad_delegate_task]
+    backup_policy:
+      enabled: true
+      pre_mutation: true
+      paths: [/srv/example/lead/workspace, /srv/example/lead/state]
+  - name: example-engineer
+    host: example-host
+    role: developer
+    workspace_path: /srv/example/engineer/workspace
+    state_path: /srv/example/engineer/state
+    team_definition_path: /srv/example/roles/engineer
+    quadlet_path: example-engineer.container
+    container_name: example-engineer
+    networks: [example-team, example-mcp-private]
+    image:
+      repository: ghcr.io/example/openclaw
+      tag: "2026.1.1"
+      digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      known_good_tag: "2026.1.0"
+      known_good_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    ports:
+      - {bind_address: 127.0.0.1, host_port: 19002, container_port: 18789}
+    env_files: [/srv/example/env/engineer.env]
+    gateway_runtime: {enabled: true, bind: lan}
+    dashboard: {friendly_name: Example Engineer, owner: example}
+    openclaw:
+      lead_agent_id: example-engineer
+      a2a:
+        enabled: true
+        peers:
+          lead:
+            instance: example-lead
+            inbound_token_env: EXAMPLE_LEAD_TO_ENGINEER
+            outbound_token_env: EXAMPLE_ENGINEER_TO_LEAD
+    mounts:
+      - {source: /srv/example/shared/briefs, target: /mnt/briefs, read_only: true}
+      - {source: /srv/example/engineer/renders, target: /mnt/renders, read_only: false}
+      - {source: /srv/example/shared/keys, target: /mnt/keys, read_only: true}
+    quadlet_default_dependencies: false
+    agent_tool_allow:
+      example-engineer:
+        - cad_inspect
+        - cad_status
+        - onshape__onshape_auth_status
+        - onshape__onshape_api_call
+    plugins:
+      - id: example-cad
+        artifact_path: /srv/example/packages/example-cad-0.0.1.tgz
+        sha256: "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+        config:
+          bindings:
+            - agentId: example-engineer
+              requesterSenderId: "000000000000000001"
+              messageChannel: discord
+              agentAccountId: example-engineer
+              discordChannelId: "000000000000000004"
+              connectionRef: example-connection
+              documentId: "000000000000000000000001"
+              primaryWorkspaceId: "000000000000000000000002"
+              workspaceId: "000000000000000000000002"
+              elementId: "000000000000000000000003"
+          liveReads: true
+          engineerAgentId: example-engineer
+          delegation:
+            leadAgentId: example-lead
+            engineerAgentId: example-engineer
+            peerSenderId: "000000000000000003"
+            accountId: example-engineer
+            keyFile: /mnt/keys/delegation.key
+          oauth:
+            clientId: example-client-id
+            clientSecretFile: /mnt/keys/example-client-secret
+            dashboardRedirectUri: http://127.0.0.1:19002/example/callback
+            applicationPermissions:
+              canReadDocuments: true
+              canWriteDocuments: false
+              canDeleteDocumentsAndWorkspaces: false
+          localMcp:
+            connectionRef: example-connection
+            credentialDirectory: /mnt/keys/mcp
+        enabled: true
+        custom_ui: true
+    global_tool_allow:
+      - cad_inspect
+      - cad_status
+      - onshape__onshape_auth_status
+      - onshape__onshape_api_call
+    onshape_mcp: true
+    onshape_mcp_enabled: true
+    backup_policy:
+      enabled: true
+      pre_mutation: true
+      paths: [/srv/example/engineer/workspace, /srv/example/engineer/state]

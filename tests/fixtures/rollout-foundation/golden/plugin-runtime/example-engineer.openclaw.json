@@ -1,0 +1,78 @@
+{
+  "tools": {
+    "allow": [
+      "read",
+      "cad_inspect",
+      "cad_status",
+      "onshape__onshape_auth_status",
+      "onshape__onshape_api_call"
+    ]
+  },
+  "plugins": {
+    "entries": {
+      "example-cad": {
+        "enabled": true,
+        "config": {
+          "bindings": [
+            {
+              "agentId": "example-engineer",
+              "requesterSenderId": "000000000000000001",
+              "messageChannel": "discord",
+              "agentAccountId": "example-engineer",
+              "discordChannelId": "000000000000000004",
+              "connectionRef": "example-connection",
+              "documentId": "000000000000000000000001",
+              "primaryWorkspaceId": "000000000000000000000002",
+              "workspaceId": "000000000000000000000002",
+              "elementId": "000000000000000000000003"
+            }
+          ],
+          "liveReads": true,
+          "engineerAgentId": "example-engineer",
+          "delegation": {
+            "leadAgentId": "example-lead",
+            "engineerAgentId": "example-engineer",
+            "peerSenderId": "000000000000000003",
+            "accountId": "example-engineer",
+            "keyFile": "/mnt/keys/delegation.key"
+          },
+          "oauth": {
+            "clientId": "example-client-id",
+            "clientSecretFile": "/mnt/keys/example-client-secret",
+            "dashboardRedirectUri": "http://127.0.0.1:19002/example/callback",
+            "applicationPermissions": {
+              "canReadDocuments": true,
+              "canWriteDocuments": false,
+              "canDeleteDocumentsAndWorkspaces": false
+            }
+          },
+          "localMcp": {
+            "connectionRef": "example-connection",
+            "credentialDirectory": "/mnt/keys/mcp"
+          }
+        }
+      }
+    }
+  },
+  "gateway": {
+    "controlUi": {
+      "experimental": {
+        "customPlugins": true
+      }
+    }
+  },
+  "agents": {
+    "entries": {
+      "example-engineer": {
+        "tools": {
+          "alsoAllow": [
+            "cad_inspect",
+            "cad_status",
+            "onshape__onshape_auth_status",
+            "onshape__onshape_api_call"
+          ]
+        }
+      }
+    }
+  }
+}
