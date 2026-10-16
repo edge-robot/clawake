@@ -306,3 +306,37 @@ def test_global_grants_never_create_a_host_allowlist(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="existing non-empty tools.allow"):
         ensure_plugin_runtime_config(engineer)
     assert json.loads(config_path.read_text()) == {"tools": {"profile": "coding"}}
+
+
+def test_v2_setup_prepares_state_path_not_workspace_openclaw(tmp_path: Path, monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    from clawake.services.resources import lifecycle
+
+    data = _raw()
+    data["version"] = 2
+    data["hosts"][0]["quadlet_root"] = str(tmp_path / "quadlets")
+    for member in data["instances"]:
+        member["workspace_path"] = str(tmp_path / member["name"] / "workspace")
+        member["team_definition_path"] = str(tmp_path / member["name"] / "role")
+    inventory = _redirected(tmp_path, data)
+    runtime = Mock()
+    runtime.daemon_reload.return_value.return_code = 0
+    runtime.restart.return_value.return_code = 0
+    monkeypatch.setattr("clawake.services.resources.SystemdService", lambda: runtime)
+    monkeypatch.setattr("clawake.services.resources.wait_ready", lambda resource: True)
+    monkeypatch.setattr("subprocess.run", Mock(side_effect=AssertionError("no subprocess")))
+
+    lifecycle(
+        inventory,
+        "setup",
+        "example-lead",
+        None,
+        TEMPLATES,
+        execute=True,
+        prepare_instances=lambda instances: None,
+    )
+
+    lead = _member(inventory, "example-lead")
+    assert lead.runtime_state_path.is_dir()
+    assert not (Path(lead.workspace_path) / ".openclaw").exists()

@@ -140,7 +140,8 @@ def lifecycle(
         if action == "setup":
             for r in selected:
                 if isinstance(r, InstanceSpec):
-                    (Path(r.workspace_path) / ".openclaw").mkdir(parents=True, exist_ok=True)
+                    # Podman needs the bind source; honour the optional state_path.
+                    r.runtime_state_path.mkdir(parents=True, exist_ok=True)
             apply_artifacts(changes)
             if systemd.daemon_reload(execute=True).return_code:
                 raise ValueError("systemd reload failed")
