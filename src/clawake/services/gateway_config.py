@@ -181,18 +181,23 @@ def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
         global_tools = payload.get("tools")
         existing = global_tools.get("allow") if isinstance(global_tools, dict) else None
         if instance.global_tool_allow and (
-            not isinstance(existing, list) or not existing
+            not isinstance(existing, list)
+            or not existing
             or not all(isinstance(name, str) for name in existing)
         ):
-            raise ValueError("global_tool_allow requires an existing non-empty tools.allow; "
-                             "Clawake will not replace default host policy")
+            raise ValueError(
+                "global_tool_allow requires an existing non-empty tools.allow; "
+                "Clawake will not replace default host policy"
+            )
         if isinstance(existing, list) and all(isinstance(name, str) for name in existing):
             unmanaged = [name for name in existing if name not in previous_global]
             next_global = [name for name in instance.global_tool_allow if name not in unmanaged]
             merged = list(dict.fromkeys([*unmanaged, *instance.global_tool_allow]))
             if not merged and existing:
-                raise ValueError("Withdrawing global grants would empty tools.allow; "
-                                 "retain an explicit operator-owned allowlist")
+                raise ValueError(
+                    "Withdrawing global grants would empty tools.allow; "
+                    "retain an explicit operator-owned allowlist"
+                )
             global_tools["allow"] = merged
 
     previous_grants = state.get("agentToolAllow", {})
@@ -263,7 +268,9 @@ def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
     if changed:
         _write_config(config_path, payload)
     next_state: dict[str, object] = {
-        "version": 1, "agentToolAllow": next_grants, "globalToolAllow": next_global
+        "version": 1,
+        "agentToolAllow": next_grants,
+        "globalToolAllow": next_global,
     }
     if state != next_state:
         _write_config(state_path, next_state)

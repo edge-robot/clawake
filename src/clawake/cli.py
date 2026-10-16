@@ -1006,6 +1006,7 @@ def onshape_mcp(
         probe_native,
         validate_runtime_paths,
     )
+
     try:
         spec = OnshapeMcpSpec.model_validate(yaml.safe_load(config.read_text()))
     except (ValueError, OSError, yaml.YAMLError) as exc:
@@ -1035,8 +1036,10 @@ def onshape_mcp(
     if action == "apply" and execute:
         validate_runtime_paths(spec)
         apply_artifacts(changes)
-        for operation in [lambda: service.daemon_reload(execute=True),
-                          lambda: service.restart(spec.name, execute=True)]:
+        for operation in [
+            lambda: service.daemon_reload(execute=True),
+            lambda: service.restart(spec.name, execute=True),
+        ]:
             result = operation()
             if result.return_code:
                 raise typer.BadParameter("Onshape MCP service start failed; inspect systemd")

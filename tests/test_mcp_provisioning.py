@@ -53,9 +53,7 @@ def test_provision_no_credentials_no_grants_no_connection_and_safe_removal(team)
     path.parent.mkdir(parents=True)
     unmanaged = {"url": "https://other.example.test/mcp"}
     path.write_text(
-        json.dumps(
-            {"mcp": {"servers": {"other": unmanaged}}, "tools": {"allow": ["message"]}}
-        )
+        json.dumps({"mcp": {"servers": {"other": unmanaged}}, "tools": {"allow": ["message"]}})
     )
     apply(plan_runtime_files(team, member))
     result = json.loads(path.read_text())
