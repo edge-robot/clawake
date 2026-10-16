@@ -1,0 +1,16 @@
+{
+  // Convenience for editors only. Agents MUST be started with scripts/dev.sh, which is
+  // the authoritative definition of mounts, read-only overlays, the git common dir of
+  // worktrees and the git identity.
+  "name": "clawake-dev",
+  "build": { "dockerfile": "../Containerfile", "context": "..", "target": "dev" },
+  "workspaceFolder": "/workspaces/clawake",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/clawake,type=bind",
+  "runArgs": ["--userns=keep-id", "--cap-drop=all", "--security-opt=no-new-privileges"],
+  "containerEnv": {
+    "HOME": "/home/dev",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.hooksPath",
+    "GIT_CONFIG_VALUE_0": "/opt/devcontainer/hooks"
+  }
+}
