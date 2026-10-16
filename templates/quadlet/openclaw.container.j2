@@ -9,6 +9,10 @@ Description=OpenClaw instance {{ instance.name }}
 After=network-online.target
 Wants=network-online.target
 {% endif %}
+{% for dependency in instance.depends_on %}
+After={{ dependency }}.service
+Requires={{ dependency }}.service
+{% endfor %}
 {% for legacy_name in instance.legacy_names %}
 Conflicts={{ legacy_name }}.service
 {% endfor %}

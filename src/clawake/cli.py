@@ -36,6 +36,10 @@ app = typer.Typer(
 )
 
 ConfigPath = Annotated[Path, typer.Option(..., "--config", "-c", exists=True, dir_okay=False)]
+OptionalServiceName = Annotated[
+    str | None, typer.Option("--service", "-s", help="Select a generic service.")
+]
+
 OptionalMemberName = Annotated[
     str | None, typer.Option("--member", "-m", help="Select one member; default: entire team.")
 ]
@@ -96,13 +100,9 @@ def sync_plugins(
     execute: ExecuteFlag = False,
 ) -> None:
     """Verify and install integrity-pinned OpenClaw plugins from the inventory."""
-    inventory = _load(config)
+    inventory = _load(config, validation_only=True)
     selected = _select_instances(inventory, member)
     declared = [(instance, plugin) for instance in selected for plugin in instance.plugins]
-    if not declared:
-        typer.echo("No managed plugins declared for the selected member(s).")
-        return
-
     typer.echo(f"Plugin sync plan for {len(declared)} pinned plugin(s)")
     plans = []
     try:
@@ -158,12 +158,14 @@ def sync_plugins(
             config_path, config_changed = ensure_plugin_runtime_config(instance)
             if config_changed:
                 typer.echo(f"Updated managed plugin config and agent ACLs in {config_path}")
-            restart_instances[instance.name] = instance
+                restart_instances[instance.name] = instance
         except (OSError, RuntimeError, ValueError) as exc:
             typer.echo(str(exc), err=True)
             failed = True
             failed_instances.add(instance.name)
     for instance in restart_instances.values():
+        if instance.name in failed_instances:
+            continue
         restart_result = service.restart(instance.name, execute=True)
         _print_result(restart_result)
         failed = failed or restart_result.return_code != 0
@@ -575,10 +577,16 @@ def diagnose_dashboard(
 def setup_quadlets(
     config: ConfigPath,
     member: OptionalMemberName = None,
+    service_name: OptionalServiceName = None,
     execute: ExecuteFlag = False,
 ) -> None:
     """Render and apply desired Quadlet definitions for the current team."""
-    inventory = _load(config)
+    inventory = _load(config, validation_only=True)
+    if inventory.version == 2:
+        _v2_operation(inventory, "setup", member, service_name, execute)
+        return
+    if service_name:
+        raise typer.BadParameter("Services require inventory v2")
     selected = _select_instances(inventory, member)
     if not selected:
         typer.echo("No matching members selected for setup")
@@ -672,10 +680,16 @@ def stop_members(
 def restart_quadlets(
     config: ConfigPath,
     member: OptionalMemberName = None,
+    service_name: OptionalServiceName = None,
     execute: ExecuteFlag = False,
 ) -> None:
     """Restart selected or all managed services after config/image changes."""
-    inventory = _load(config)
+    inventory = _load(config, validation_only=True)
+    if inventory.version == 2:
+        _v2_operation(inventory, "restart", member, service_name, execute)
+        return
+    if service_name:
+        raise typer.BadParameter("Services require inventory v2")
     selected = _select_instances(inventory, member)
     if not selected:
         typer.echo("No matching members selected for restart")
@@ -703,10 +717,16 @@ def restart_quadlets(
 def status_quadlets(
     config: ConfigPath,
     member: OptionalMemberName = None,
+    service_name: OptionalServiceName = None,
     format: StatusFormat = "text",
 ) -> None:
     """Aggregate per-member runtime status with optional machine-readable output."""
-    inventory = _load(config)
+    inventory = _load(config, validation_only=True)
+    if inventory.version == 2:
+        _v2_operation(inventory, "status", member, service_name, False, format)
+        return
+    if service_name:
+        raise typer.BadParameter("Services require inventory v2")
     selected = _select_instances(inventory, member)
     service = SystemdService()
     rows: list[dict[str, object]] = []
@@ -767,10 +787,16 @@ def status_quadlets(
 def teardown_quadlets(
     config: ConfigPath,
     member: OptionalMemberName = None,
+    service_name: OptionalServiceName = None,
     execute: ExecuteFlag = False,
 ) -> None:
     """Remove managed runtime services for selected members or whole teams."""
-    inventory = _load(config)
+    inventory = _load(config, validation_only=True)
+    if inventory.version == 2:
+        _v2_operation(inventory, "teardown", member, service_name, execute)
+        return
+    if service_name:
+        raise typer.BadParameter("Services require inventory v2")
     selected = _select_instances(inventory, member)
     if not selected:
         typer.echo("No matching members selected for teardown")
@@ -853,21 +879,107 @@ def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) ->
     )
 
 
+@app.command("upgrade-service")
+def service_upgrade(
+    config: ConfigPath,
+    service_name: Annotated[str, typer.Option(..., "--service", "-s")],
+    tag: TargetTag,
+    digest: Annotated[str, typer.Option(..., "--digest")],
+    execute: ExecuteFlag = False,
+    with_dependents: Annotated[bool, typer.Option("--with-dependents")] = False,
+) -> None:
+    """Preview a pinned generic service upgrade with consistent private backups."""
+    from clawake.services.service_upgrade import upgrade_service
+
+    try:
+        for entry in upgrade_service(
+            config,
+            service_name,
+            tag,
+            digest,
+            _template_root(),
+            execute=execute,
+            include_dependents=with_dependents,
+        ):
+            typer.echo(entry)
+        if not execute:
+            typer.echo("DRY RUN; re-run with --execute to apply")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 @app.command("logs")
 def member_logs(
     config: ConfigPath,
-    member: Annotated[str, typer.Option(..., "--member", "-m")],
+    member: OptionalMemberName = None,
+    service_name: OptionalServiceName = None,
     lines: Annotated[int, typer.Option("--lines", "-n", min=1, max=10000)] = 100,
 ) -> None:
-    """Read the latest journal entries for one member."""
-    instance = _instance_by_name(_load(config), member)
-    result = SystemdService().logs(instance.name, lines=lines, execute=True)
+    """Read the latest journal entries for one resource."""
+    from clawake.services.resources import select_resources
+
+    inventory = _load(config, validation_only=True)
+    if not member and not service_name:
+        raise typer.BadParameter("Select --member or --service for logs")
+    try:
+        selected = select_resources(inventory, member, service_name)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    result = SystemdService().logs(selected[0].name, lines=lines, execute=True)
     if result.stdout:
         typer.echo(result.stdout)
     if result.stderr:
         typer.echo(result.stderr, err=True)
     if result.return_code:
         raise typer.Exit(code=1)
+
+
+def _v2_operation(inventory, action, member, service_name, execute=False, format="text"):
+    from clawake.services.resources import lifecycle, status_rows
+
+    try:
+        if action == "status":
+            rows = status_rows(inventory, member, service_name)
+            if format == "json":
+                typer.echo(
+                    json.dumps({"cluster": inventory.cluster.name, "resources": rows}, indent=2)
+                )
+            else:
+                for row in rows:
+                    typer.echo(
+                        f"{row['name']}: active={row['active']} readiness={row['readiness']}"
+                    )
+            if any(
+                not row["active"]
+                or row["readiness"] not in {"healthy", "running"}
+                or row["failed_dependencies"]
+                for row in rows
+            ):
+                raise typer.Exit(1)
+        else:
+
+            def prepare_instances(instances):
+                _check_a2a_environment(instances, inventory)
+                roots = {h.name: Path(h.quadlet_root) for h in inventory.hosts}
+                if not _retire_legacy_services(
+                    SystemdService(), instances, disable=action == "setup", quadlet_roots=roots
+                ):
+                    raise ValueError("Cannot retire legacy members")
+
+            for entry in lifecycle(
+                inventory,
+                action,
+                member,
+                service_name,
+                _template_root(),
+                execute=execute,
+                prepare_instances=prepare_instances,
+            ):
+                typer.echo(entry)
+            if not execute:
+                typer.echo("DRY RUN; re-run with --execute to apply")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 # Intent-oriented names; established commands remain compatible with scripts and Make.

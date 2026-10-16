@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import AfterValidator, ConfigDict, Field, JsonValue, field_validator, model_validator
@@ -219,6 +220,8 @@ class VolumeSpec(BaseModel):
 
 
 class SecretRef(BaseModel):
+    uid: int | None = Field(default=None, ge=0, le=2147483647)
+    gid: int | None = Field(default=None, ge=0, le=2147483647)
     name: ResourceName
     target: ResourceName | None = None
 
@@ -245,6 +248,9 @@ class ServiceBackupPolicy(BackupPolicy):
 
 
 class ServiceSpec(BaseModel):
+    read_only: bool = False
+    user: str | None = Field(default=None, pattern=r"^[0-9]{1,10}:[0-9]{1,10}$")
+    quadlet_default_dependencies: bool = True
     name: ResourceName
     host: ResourceName
     image: ServiceImageSpec
@@ -326,10 +332,80 @@ class A2ASpec(BaseModel):
         return value
 
 
+class McpServerSpec(BaseModel):
+    """Remote OAuth MCP, executed and authenticated exclusively by OpenClaw.
+
+    Provisioning never connects, copies credentials, or grants agent tools.
+    Tool names are exact provider names, before OpenClaw's server namespace.
+    """
+
+    url: str
+    enabled: bool = False
+    transport: Literal["streamable-http", "sse"] = "streamable-http"
+    tools: list[str] = Field(min_length=1)
+    oauth_scope: str = Field(min_length=1, max_length=512)
+    request_timeout_ms: int = Field(default=30000, ge=1000, le=120000)
+    connection_timeout_ms: int = Field(default=10000, ge=1000, le=60000)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError("MCP URL must be HTTPS without credentials, query or fragment")
+        return value
+
+    @field_validator("tools")
+    @classmethod
+    def validate_tools(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value) or any(
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", tool) for tool in value
+        ):
+            raise ValueError("MCP tools must be unique exact names; wildcards are forbidden")
+        return value
+
+    @field_validator("oauth_scope")
+    @classmethod
+    def validate_scope(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._:/-]+(?: [A-Za-z0-9._:/-]+)*", value):
+            raise ValueError("Invalid explicit OAuth scope")
+        return value
+
+    def runtime_config(self) -> dict:
+        return {
+            "url": self.url,
+            "enabled": self.enabled,
+            "transport": self.transport,
+            "auth": "oauth",
+            "oauth": {"identity": "shared", "scope": self.oauth_scope},
+            "sslVerify": True,
+            "supportsParallelToolCalls": False,
+            "requestTimeoutMs": self.request_timeout_ms,
+            "connectionTimeoutMs": self.connection_timeout_ms,
+            "toolFilter": {"include": self.tools},
+        }
+
+
 class OpenClawSpec(BaseModel):
     lead_agent_id: str = Field(default="main", pattern=r"^[a-z][a-z0-9_-]*$")
     subagents: SubagentSpec | None = None
     a2a: A2ASpec = Field(default_factory=A2ASpec)
+    mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)
+
+    @field_validator("mcp_servers")
+    @classmethod
+    def validate_mcp_names(cls, value: dict[str, McpServerSpec]) -> dict[str, McpServerSpec]:
+        if any(not re.fullmatch(r"[a-z][a-z0-9_]{0,23}", name) for name in value):
+            raise ValueError("MCP server names must be stable lowercase tool namespaces")
+        return value
 
 
 class InstanceSpec(BaseModel):
@@ -427,6 +503,11 @@ class InstanceSpec(BaseModel):
     def ensure_backup_defaults(self) -> InstanceSpec:
         if self.onshape_mcp_enabled and not self.onshape_mcp:
             raise ValueError("onshape_mcp_enabled requires the managed onshape_mcp connector")
+        if self.onshape_mcp and self.openclaw and "onshape" in self.openclaw.mcp_servers:
+            raise ValueError(
+                f"instances[{self.name}]: MCP server 'onshape' is configured by both "
+                "onshape_mcp and openclaw.mcp_servers; declare it in only one place"
+            )
         if self.name in self.legacy_names:
             raise ValueError(f"instances[{self.name}].legacy_names must not include its name")
         quadlet = Path(self.quadlet_path)

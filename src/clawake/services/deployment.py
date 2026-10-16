@@ -7,9 +7,12 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from clawake.config import InstanceSpec, Inventory
-from clawake.inventory_validation import require_v1_runtime
-from clawake.services.render import render_instance_assets, render_shared_network
+from clawake.config import InstanceSpec, Inventory, ServiceSpec
+from clawake.services.render import (
+    render_instance_assets,
+    render_service_assets,
+    render_shared_network,
+)
 from clawake.services.runtime_config import plan_runtime_files
 
 
@@ -25,10 +28,9 @@ class ArtifactChange:
 
 
 def plan_deployment(
-    inventory: Inventory, instances: list[InstanceSpec], template_root: Path
+    inventory: Inventory, instances: list[InstanceSpec | ServiceSpec], template_root: Path
 ) -> list[ArtifactChange]:
     """Render desired state in memory and compare it with installed artifacts."""
-    require_v1_runtime(inventory)
     hosts = {host.name: host for host in inventory.hosts}
     changes = []
     required_networks = {name for instance in instances for name in instance.networks}
@@ -50,24 +52,31 @@ def plan_deployment(
             )
     for instance in instances:
         root = Path(hosts[instance.host].quadlet_root).expanduser()
-        for relative, content in render_instance_assets(instance, template_root).items():
+        assets = (
+            render_instance_assets(instance, template_root)
+            if isinstance(instance, InstanceSpec)
+            else render_service_assets(instance)
+        )
+        for relative, content in assets.items():
             destination = root / relative
             current = destination.read_text(encoding="utf-8") if destination.exists() else None
             if current != content:
                 changes.append(
                     ArtifactChange(
                         instance.name,
-                        instance.role,
+                        instance.role if isinstance(instance, InstanceSpec) else "service",
                         destination,
                         content,
                         previous=current,
                     )
                 )
+        if not isinstance(instance, InstanceSpec):
+            continue
         for destination, content, current, keys in plan_runtime_files(inventory, instance):
             changes.append(
                 ArtifactChange(
                     instance.name,
-                    instance.role,
+                    instance.role if isinstance(instance, InstanceSpec) else "service",
                     destination,
                     content,
                     "runtime",

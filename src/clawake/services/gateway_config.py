@@ -254,7 +254,10 @@ def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
             tools[key] = merged
             changed = True
 
-        next_grants[agent_id] = {"key": key, "tools": managed_tools}
+        # Own only additions made by Clawake. A pre-existing operator grant of
+        # the same name must survive when it disappears from the inventory.
+        owned_tools = [item for item in managed_tools if item not in existing]
+        next_grants[agent_id] = {"key": key, "tools": owned_tools}
 
     changed = payload != original_payload
     if changed:

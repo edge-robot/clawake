@@ -65,6 +65,12 @@ def desired_fields(inventory: Inventory, instance: InstanceSpec) -> dict:
         return mcp
     desired = {f"agents/entries/{settings.lead_agent_id}/workspace": "/workspace"}
     desired.update(mcp)
+    for name, server in settings.mcp_servers.items():
+        path = f"mcp/servers/{name}"
+        # InstanceSpec validation rejects this; never let one MCP model override the other.
+        if path in desired:
+            raise ValueError(f"MCP server '{name}' is configured by onshape_mcp and mcp_servers")
+        desired[path] = server.runtime_config()
     if settings.subagents:
         spec = settings.subagents
         desired.update(
@@ -146,6 +152,10 @@ def plan_runtime_files(
         assert parent is not None
         node, key = parent
         existing = node.get(key, _MISSING)
+        # Drift guard: a field Clawake already owns must still hold the value it wrote.
+        if path in old_fields and existing is not _MISSING and existing != old_fields[path]:
+            raise ValueError(f"Managed field changed outside Clawake: {path}")
+        # One-time adoption of a not-yet-managed, disabled hosted Onshape connector.
         adopting_disabled_hosted_onshape = (
             instance.onshape_mcp
             and path == "mcp/servers/onshape"
