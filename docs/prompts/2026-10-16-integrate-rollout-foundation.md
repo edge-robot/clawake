@@ -6,7 +6,7 @@ issue: edge-robot/clawake#25
 architecture-ref: clawake/docs/architecture.md
 base-commit: 08f5a11 (4da3957 demo/gateway-native-read-20261014 + devcontainer commit)
 merge-source: feat/agent-mcp-provisioning @ e505969
-status: issued
+status: done
 ---
 # Integrate demo/gateway-native-read and feat/agent-mcp-provisioning
 
