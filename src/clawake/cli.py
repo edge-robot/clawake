@@ -36,6 +36,15 @@ from clawake.services.readiness import (
     probe_member,
     wait_members_ready,
 )
+from clawake.services.rollout import (
+    RolloutUsageError,
+    build_candidate,
+    execute_rollout,
+    failure_hint,
+    plan_rollout,
+    preview_lines,
+    summary_lines,
+)
 from clawake.services.runtime_pins import (
     RuntimePinsWarning,
     count_fields,
@@ -202,6 +211,71 @@ def sync_plugins(
     if failed:
         typer.echo("Plugin sync stopped at the first failing member.", err=True)
         raise typer.Exit(code=1)
+
+
+BACKUP_DIR = Path(".backups")
+MemberNames = Annotated[
+    list[str] | None,
+    typer.Option("--member", "-m", help="Select a member; repeatable. Default: entire team."),
+]
+PluginArchives = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--plugin",
+        help="Roll out an archive plugin: <id>=<path-to-tgz>; repeatable. Requires runtime_pins.",
+    ),
+]
+
+
+@app.command("rollout")
+def rollout(
+    config: ConfigPath,
+    member: MemberNames = None,
+    plugin: PluginArchives = None,
+    execute: ExecuteFlag = False,
+) -> None:
+    """Roll out members in one step: backup, apply, restart, readiness, plugins, verify, pins."""
+    layers = _load_layers(config, validation_only=True)
+    try:
+        candidate = build_candidate(layers, member or [], plugin or [])
+    except RolloutUsageError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    service = SystemdService()
+    probes = default_probes(service)
+    pins = candidate.changed_pins
+    typer.echo(
+        f"Rollout plan for cluster '{candidate.inventory.cluster.name}': "
+        f"{len(candidate.selected)} member(s), {len(pins)} plugin pin change(s)"
+    )
+    if candidate.pins_path is not None:
+        typer.echo(
+            f"Runtime pins: {candidate.pins_path} (a member's new pins are committed only "
+            "after it verified)"
+        )
+    try:
+        # Read-only: rendered diff, unit state, readiness, ledger and config diff.
+        plan = plan_rollout(candidate, probes, _template_root(), BACKUP_DIR)
+    except (OSError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    _print_plan(list(plan.artifacts))
+    for line in preview_lines(plan):
+        typer.echo(line)
+    if not execute:
+        typer.echo("DRY RUN rollout complete. Re-run with --execute.")
+        return
+
+    # No A2A environment check here: it reads token values, and rollout never reads secrets.
+    result = execute_rollout(plan, service, probes, echo=typer.echo, on_result=_print_result)
+    typer.echo("Rollout summary:")
+    for line in summary_lines(result):
+        typer.echo(line)
+    if result.failed:
+        for line in failure_hint(plan, result):
+            typer.echo(line, err=True)
+        raise typer.Exit(code=1)
+    typer.echo("Rollout complete.")
 
 
 def _print_result(result: CommandResult) -> None:
