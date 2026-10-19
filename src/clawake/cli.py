@@ -465,6 +465,32 @@ def _check_discord_token_env(instances: list[InstanceSpec]) -> None:
             raise typer.Exit(code=2)
 
 
+def _plan_or_exit(
+    inventory: Inventory,
+    selected: list[InstanceSpec],
+    adopt: tuple[str, ...] | None,
+) -> tuple[dict[str, tuple[str, ...]], list[ArtifactChange]]:
+    """Plan read-only; a planning refusal becomes `Error: <message>` with exit 1.
+
+    `adopt=None` means: plan with every pending adoption (validate never writes). The
+    adoption preconditions still run. Returns the pending adoptions per member that are
+    covered by the plan, and the planned changes.
+    """
+    try:
+        pending = {
+            instance.name: names
+            for instance in selected
+            if (adopt is None or adopt) and (names := pending_adoptions(inventory, instance))
+        }
+        if adopt is None:
+            adopt = tuple(dict.fromkeys(name for names in pending.values() for name in names))
+        changes = plan_deployment(inventory, selected, _template_root(), adopt=adopt)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    return pending, changes
+
+
 def _requested_adoptions(adopt: list[str] | None) -> tuple[str, ...]:
     names = tuple(dict.fromkeys(adopt or ()))
     for name in names:
@@ -787,17 +813,8 @@ def setup_quadlets(
         return
     _check_discord_token_env(selected)
 
-    try:
-        # Read-only: which members need a requested named adoption (and a backup first).
-        adoptions = {
-            instance.name: names
-            for instance in selected
-            if requested and (names := pending_adoptions(inventory, instance))
-        }
-        changed_artifacts = plan_deployment(inventory, selected, _template_root(), adopt=requested)
-    except ValueError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
+    # Read-only: which members need a requested named adoption (and a backup first).
+    adoptions, changed_artifacts = _plan_or_exit(inventory, selected, requested)
     changed_instance_names = {
         change.member for change in changed_artifacts if change.role != "shared_network"
     }
@@ -1173,7 +1190,8 @@ def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) ->
             "Model validation only; no rendering or runtime/secret existence checks."
         )
         return
-    changes = plan_deployment(inventory, selected, _template_root())
+    # Plan with every pending adoption: validate never writes, never adopts (ADR-005 item 5).
+    pending, changes = _plan_or_exit(inventory, selected, None)
     typer.echo(
         f"Valid inventory: {inventory.cluster.name}; {len(selected)} member(s), "
         f"{len(changes)} artifact change(s)."
@@ -1192,6 +1210,12 @@ def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) ->
             typer.echo(
                 f"WARNING: site values file {site.path}: unused values: {', '.join(site.unused)}",
                 err=True,
+            )
+    for name, names in pending.items():
+        for adoption in names:
+            typer.echo(
+                f"pending adoption: {name} {adoption} "
+                f"(review with: clawake setup -c {config} --adopt {adoption})"
             )
 
 
