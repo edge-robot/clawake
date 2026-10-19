@@ -64,37 +64,54 @@ def resolve_pins_path(reference: str, inventory_path: Path) -> Path:
     return Path(os.path.normpath(path))
 
 
-def read_overlay_file(path: Path) -> object:
-    """Read and parse the overlay; refuse group/world-writable files, warn on readable ones."""
+def read_private_json(
+    path: Path,
+    *,
+    label: str,
+    error: type[ValueError],
+    warning: type[UserWarning],
+) -> object:
+    """Read an operator- or Clawake-owned private JSON file with the ADR-004 safety rules.
+
+    Refuses group/world-writable and non-regular files, warns on group/world-readable ones.
+    Error messages name the file, never its content.
+    """
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except FileNotFoundError as exc:
-        raise RuntimePinsError(f"runtime pins file {path} does not exist") from exc
+        raise error(f"{label} {path} does not exist") from exc
     except OSError as exc:
-        raise RuntimePinsError(f"cannot open runtime pins file {path}: {exc.strerror}") from exc
+        raise error(f"cannot open {label} {path}: {exc.strerror}") from exc
     with os.fdopen(descriptor, "rb") as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
-            raise RuntimePinsError(f"runtime pins file {path} is not a regular file")
+            raise error(f"{label} {path} is not a regular file")
         mode = stat.S_IMODE(info.st_mode)
         if mode & 0o022:
-            raise RuntimePinsError(
-                f"runtime pins file {path} is group- or world-writable (mode {mode:04o}); "
+            raise error(
+                f"{label} {path} is group- or world-writable (mode {mode:04o}); "
                 f"run: chmod 600 {path}"
             )
         if mode & 0o044:
             warnings.warn(
-                f"runtime pins file {path} is group- or world-readable (mode {mode:04o}); "
+                f"{label} {path} is group- or world-readable (mode {mode:04o}); "
                 f"run: chmod 600 {path}",
-                RuntimePinsWarning,
-                stacklevel=2,
+                warning,
+                stacklevel=3,
             )
         raw = handle.read()
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         position = f" at line {exc.lineno}" if isinstance(exc, json.JSONDecodeError) else ""
-        raise RuntimePinsError(f"runtime pins file {path}: invalid JSON{position}") from exc
+        raise error(f"{label} {path}: invalid JSON{position}") from None
+
+
+def read_overlay_file(path: Path) -> object:
+    """Read and parse the overlay; refuse group/world-writable files, warn on readable ones."""
+    return read_private_json(
+        path, label="runtime pins file", error=RuntimePinsError, warning=RuntimePinsWarning
+    )
 
 
 # --- validation -----------------------------------------------------------------------------

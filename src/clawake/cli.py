@@ -20,6 +20,7 @@ from clawake.config import (
 from clawake.inventory_validation import require_v1_runtime
 from clawake.services.backup import backup_instance, prune_backups
 from clawake.services.deployment import ArtifactChange, apply_artifacts, plan_deployment
+from clawake.services.env_keys import EnvKeysError, env_file_keys
 from clawake.services.image_check import ImageCheckError, check_image_availability
 from clawake.services.member_ops import (
     plan_member_plugins,
@@ -37,6 +38,7 @@ from clawake.services.readiness import (
     wait_members_ready,
 )
 from clawake.services.rollout import (
+    TIMESTAMP_PLACEHOLDER,
     RolloutUsageError,
     build_candidate,
     execute_rollout,
@@ -45,6 +47,7 @@ from clawake.services.rollout import (
     preview_lines,
     summary_lines,
 )
+from clawake.services.runtime_config import ADOPTIONS, pending_adoptions
 from clawake.services.runtime_pins import (
     RuntimePinsWarning,
     count_fields,
@@ -59,6 +62,7 @@ from clawake.services.runtime_upgrade import (
     run_doctor,
     verify_runtime,
 )
+from clawake.services.site_values import SiteValuesWarning
 from clawake.services.systemd import CommandResult, SystemdService
 from clawake.services.upgrade import (
     apply_upgrade,
@@ -88,6 +92,13 @@ StatusFormat = Annotated[Literal["text", "json"], typer.Option("--format")]
 ShowTokenUrlFlag = Annotated[bool, typer.Option("--show-token-url")]
 TargetTag = Annotated[str, typer.Option(..., "--to", help="Target OpenClaw image tag")]
 TargetDigest = Annotated[str | None, typer.Option("--digest", help="Immutable target digest")]
+AdoptNames = Annotated[
+    list[str] | None,
+    typer.Option(
+        "--adopt",
+        help="Take over a named, not-yet-owned OpenClaw field once (discord-channel).",
+    ),
+]
 
 _ENV_LINE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
@@ -102,9 +113,10 @@ def _load_layers(
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", RuntimePinsWarning)
+            warnings.simplefilter("always", SiteValuesWarning)
             layers = load_inventory_layers(path, allow_missing_pins=allow_missing_pins)
         for warning in caught:
-            if issubclass(warning.category, RuntimePinsWarning):
+            if issubclass(warning.category, (RuntimePinsWarning, SiteValuesWarning)):
                 typer.echo(f"WARNING: {warning.message}", err=True)
             else:
                 warnings.warn_explicit(
@@ -417,6 +429,54 @@ def _print_plan(changes: list[ArtifactChange]) -> None:
             typer.echo(f"   changed keys: {', '.join(change.changed_keys)}")
 
 
+def _check_discord_token_env(instances: list[InstanceSpec]) -> None:
+    """Fail closed unless token_env is a key in a member env file (ADR-005 item 4).
+
+    Uses key names only; token values are never read into memory beyond the line parser.
+    """
+    for instance in instances:
+        spec = instance.openclaw.discord if instance.openclaw else None
+        if spec is None or not spec.enabled or spec.token_env is None:
+            continue
+        missing: list[str] = []
+        declared = False
+        for raw_path in instance.env_files:
+            path = Path(raw_path).expanduser()
+            if not path.is_file():
+                missing.append(str(path))
+                continue
+            try:
+                keys = env_file_keys(path)
+            except EnvKeysError as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(code=2) from None
+            if spec.token_env in keys:
+                declared = True
+                break
+        if not declared:
+            files = ", ".join(instance.env_files) or "none"
+            detail = f"; missing: {', '.join(missing)}" if missing else ""
+            typer.echo(
+                f"Error: discord.token_env {spec.token_env} of member {instance.name} is not "
+                f"declared as a key in its env_files ({files}{detail}); add "
+                f"{spec.token_env}=<bot token> to one of them",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+
+
+def _requested_adoptions(adopt: list[str] | None) -> tuple[str, ...]:
+    names = tuple(dict.fromkeys(adopt or ()))
+    for name in names:
+        if name not in ADOPTIONS:
+            typer.echo(
+                f"Error: Unknown adoption '{name}'. Available: {', '.join(sorted(ADOPTIONS))}",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+    return names
+
+
 def _check_a2a_environment(instances: list[InstanceSpec], inventory: Inventory) -> None:
     """Check configured environment files before writes; never disclose values."""
     environments = {item.name: _instance_env_values(item) for item in inventory.instances}
@@ -709,20 +769,35 @@ def setup_quadlets(
     member: OptionalMemberName = None,
     service_name: OptionalServiceName = None,
     execute: ExecuteFlag = False,
+    adopt: AdoptNames = None,
 ) -> None:
     """Render and apply desired Quadlet definitions for the current team."""
     inventory = _load(config, validation_only=True)
     if inventory.version == 2:
+        if adopt:
+            raise typer.BadParameter("--adopt requires inventory v1", param_hint="--adopt")
         _v2_operation(inventory, "setup", member, service_name, execute)
         return
     if service_name:
         raise typer.BadParameter("Services require inventory v2")
+    requested = _requested_adoptions(adopt)
     selected = _select_instances(inventory, member)
     if not selected:
         typer.echo("No matching members selected for setup")
         return
+    _check_discord_token_env(selected)
 
-    changed_artifacts = plan_deployment(inventory, selected, _template_root())
+    try:
+        # Read-only: which members need a requested named adoption (and a backup first).
+        adoptions = {
+            instance.name: names
+            for instance in selected
+            if requested and (names := pending_adoptions(inventory, instance))
+        }
+        changed_artifacts = plan_deployment(inventory, selected, _template_root(), adopt=requested)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     changed_instance_names = {
         change.member for change in changed_artifacts if change.role != "shared_network"
     }
@@ -733,6 +808,11 @@ def setup_quadlets(
     )
 
     _print_plan(changed_artifacts)
+    if adoptions:
+        typer.echo("Adoptions:")
+        for name, names in adoptions.items():
+            backup = BACKUP_DIR / f"{name}-{TIMESTAMP_PLACEHOLDER}.tar.gz"
+            typer.echo(f" - {name}: adopt {', '.join(names)} (backup first: {backup})")
     service = SystemdService()
     probes = default_probes(service)
     # Read-only: the unit state of unchanged members decides between start and none.
@@ -751,6 +831,21 @@ def setup_quadlets(
         return
 
     _check_a2a_environment(selected, inventory)
+
+    # ADR-005 item 5: the member backup precedes replacing an adopted field.
+    for instance in selected:
+        if instance.name not in adoptions:
+            continue
+        try:
+            archive = backup_instance(instance, BACKUP_DIR, execute=True)
+        except OSError as exc:
+            typer.echo(
+                f"Backup before adopting {', '.join(adoptions[instance.name])} for "
+                f"{instance.name} failed: {exc}. Nothing was changed.",
+                err=True,
+            )
+            raise typer.Exit(code=1) from exc
+        typer.echo(f"Created runtime backup for {instance.name}: {archive}")
 
     quadlet_roots = {host.name: Path(host.quadlet_root).expanduser() for host in inventory.hosts}
     if not _retire_legacy_services(
@@ -1086,6 +1181,18 @@ def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) ->
     if layers.overlay is not None:
         members, fields = count_fields(layers.overlay)
         typer.echo(f"runtime pins: {layers.pins_path} ({members} members, {fields} fields)")
+    if layers.site is not None:
+        site = layers.site
+        typer.echo(
+            f"site values: {site.path} ({site.value_count} values, "
+            f"{len(site.references)} references)"
+        )
+        if site.unused:
+            # Names only, never values (ADR-005 item 2).
+            typer.echo(
+                f"WARNING: site values file {site.path}: unused values: {', '.join(site.unused)}",
+                err=True,
+            )
 
 
 @app.command("upgrade-service")

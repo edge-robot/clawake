@@ -1,0 +1,33 @@
+{
+  "enabled": true,
+  "token": {
+    "source": "env",
+    "provider": "default",
+    "id": "DISCORD_BOT_TOKEN"
+  },
+  "applicationId": "100000000000000010",
+  "dmPolicy": "allowlist",
+  "allowFrom": [
+    "100000000000000003",
+    "100000000000000004"
+  ],
+  "groupPolicy": "allowlist",
+  "guilds": {
+    "100000000000000001": {
+      "requireMention": true,
+      "roles": [
+        "100000000000000005"
+      ],
+      "channels": {
+        "100000000000000002": {
+          "enabled": true,
+          "requireMention": true,
+          "users": [
+            "100000000000000003",
+            "100000000000000004"
+          ]
+        }
+      }
+    }
+  }
+}

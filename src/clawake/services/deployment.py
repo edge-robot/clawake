@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,9 +29,16 @@ class ArtifactChange:
 
 
 def plan_deployment(
-    inventory: Inventory, instances: list[InstanceSpec | ServiceSpec], template_root: Path
+    inventory: Inventory,
+    instances: list[InstanceSpec | ServiceSpec],
+    template_root: Path,
+    *,
+    adopt: Collection[str] = (),
 ) -> list[ArtifactChange]:
-    """Render desired state in memory and compare it with installed artifacts."""
+    """Render desired state in memory and compare it with installed artifacts.
+
+    ``adopt`` names requested one-time adoptions of unowned OpenClaw fields (ADR-005).
+    """
     hosts = {host.name: host for host in inventory.hosts}
     changes = []
     required_networks = {name for instance in instances for name in instance.networks}
@@ -72,7 +80,9 @@ def plan_deployment(
                 )
         if not isinstance(instance, InstanceSpec):
             continue
-        for destination, content, current, keys in plan_runtime_files(inventory, instance):
+        for destination, content, current, keys in plan_runtime_files(
+            inventory, instance, adopt=adopt
+        ):
             changes.append(
                 ArtifactChange(
                     instance.name,

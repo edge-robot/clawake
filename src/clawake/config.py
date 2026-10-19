@@ -10,7 +10,15 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 import yaml
-from pydantic import AfterValidator, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic import BaseModel as PydanticBaseModel
 
 from clawake.inventory_validation import (
@@ -27,6 +35,15 @@ from clawake.services.runtime_pins import (
     read_overlay_file,
     resolve_pins_path,
     validate_overlay,
+)
+from clawake.services.site_values import (
+    SITE_VALUES_V1_ONLY,
+    SiteSubstitution,
+    SiteValuesError,
+    explain_validation_error,
+    read_site_values_file,
+    substitute_references,
+    validate_site_values,
 )
 
 
@@ -409,11 +426,160 @@ class McpServerSpec(BaseModel):
         }
 
 
+ENV_NAME_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
+_SNOWFLAKE = re.compile(r"[0-9]{17,20}")
+
+
+def _snowflake(value: str) -> str:
+    # Never echo the value: IDs are private site data (ADR-005).
+    if not _SNOWFLAKE.fullmatch(value):
+        raise ValueError(
+            "must be a numeric Discord snowflake (17-20 digits); names, tags and '*' are "
+            "not allowed"
+        )
+    return value
+
+
+Snowflake = Annotated[str, AfterValidator(_snowflake)]
+
+
+def _unique_ids(values: list[str]) -> list[str]:
+    if len(values) != len(set(values)):
+        raise ValueError("must not contain duplicate IDs")
+    return values
+
+
+SnowflakeList = Annotated[list[Snowflake], AfterValidator(_unique_ids)]
+
+
+class DiscordChannelSpec(BaseModel):
+    """One allowed guild channel; a guild with channels denies every unlisted channel."""
+
+    id: Snowflake
+    enabled: bool = True
+    require_mention: bool | None = None
+    users: SnowflakeList = Field(default_factory=list)
+    roles: SnowflakeList = Field(default_factory=list)
+
+
+class DiscordGuildSpec(BaseModel):
+    id: Snowflake
+    require_mention: bool = True
+    users: SnowflakeList = Field(default_factory=list)
+    roles: SnowflakeList = Field(default_factory=list)
+    channels: list[DiscordChannelSpec] = Field(default_factory=list)
+
+
+class DiscordSpec(BaseModel):
+    """Default-account Discord channel of one member (ADR-005 item 3).
+
+    IDs come from site values; the token is only ever an env SecretRef named by token_env.
+    """
+
+    enabled: bool = True
+    token_env: str | None = Field(default=None, pattern=ENV_NAME_PATTERN)
+    application_id: Snowflake | None = None
+    dm_policy: Literal["disabled", "allowlist", "pairing"] = "disabled"
+    allow_from: SnowflakeList = Field(default_factory=list)
+    group_policy: Literal["allowlist", "disabled"] = "allowlist"
+    guilds: list[DiscordGuildSpec] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_access(self) -> DiscordSpec:
+        # Messages name positions, never IDs.
+        if not self.enabled:
+            extra = sorted(self.model_fields_set - {"enabled"})
+            if extra:
+                raise ValueError(
+                    "discord.enabled is false, which allows no other key; remove: "
+                    + ", ".join(extra)
+                )
+            return self
+        if self.token_env is None:
+            raise ValueError("discord.token_env is required when Discord is enabled")
+        if self.dm_policy == "allowlist" and not self.allow_from:
+            raise ValueError(
+                "discord.allow_from is required and non-empty with dm_policy allowlist"
+            )
+        if self.dm_policy != "allowlist" and "allow_from" in self.model_fields_set:
+            raise ValueError("discord.allow_from is only allowed with dm_policy: allowlist")
+        guild_ids: set[str] = set()
+        channel_ids: set[str] = set()
+        for guild_index, guild in enumerate(self.guilds):
+            if guild.id in guild_ids:
+                raise ValueError(f"duplicate guild id in discord.guilds[{guild_index}]")
+            guild_ids.add(guild.id)
+            for channel_index, channel in enumerate(guild.channels):
+                if channel.id in channel_ids:
+                    raise ValueError(
+                        f"duplicate channel id in discord.guilds[{guild_index}]"
+                        f".channels[{channel_index}]"
+                    )
+                channel_ids.add(channel.id)
+        if self.group_policy == "allowlist":
+            # #21: no guild channel may be open to every member of the guild.
+            for guild_index, guild in enumerate(self.guilds):
+                guild_allowlist = bool(guild.users or guild.roles)
+                if not guild.channels and not guild_allowlist:
+                    raise ValueError(
+                        f"discord.guilds[{guild_index}]: group_policy allowlist requires "
+                        "non-empty users or roles on a guild without channels (no channel "
+                        "open to the whole guild)"
+                    )
+                for channel_index, channel in enumerate(guild.channels):
+                    if channel.enabled and not (channel.users or channel.roles or guild_allowlist):
+                        raise ValueError(
+                            f"discord.guilds[{guild_index}].channels[{channel_index}]: "
+                            "group_policy allowlist requires non-empty users or roles on the "
+                            "channel or its guild (no channel open to the whole guild)"
+                        )
+        return self
+
+    def runtime_config(self) -> dict:
+        """The whole ``channels.discord`` object in OpenClaw's current key names."""
+        if not self.enabled:
+            return {"enabled": False}
+        config: dict = {
+            "enabled": True,
+            "token": {"source": "env", "provider": "default", "id": self.token_env},
+        }
+        if self.application_id is not None:
+            config["applicationId"] = self.application_id
+        config["dmPolicy"] = self.dm_policy
+        if self.allow_from:
+            config["allowFrom"] = list(self.allow_from)
+        config["groupPolicy"] = self.group_policy
+        guilds: dict = {}
+        for guild in self.guilds:
+            entry: dict = {"requireMention": guild.require_mention}
+            if guild.users:
+                entry["users"] = list(guild.users)
+            if guild.roles:
+                entry["roles"] = list(guild.roles)
+            channels: dict = {}
+            for channel in guild.channels:
+                channel_entry: dict = {"enabled": channel.enabled}
+                if channel.require_mention is not None:
+                    channel_entry["requireMention"] = channel.require_mention
+                if channel.users:
+                    channel_entry["users"] = list(channel.users)
+                if channel.roles:
+                    channel_entry["roles"] = list(channel.roles)
+                channels[channel.id] = channel_entry
+            if channels:
+                entry["channels"] = channels
+            guilds[guild.id] = entry
+        if guilds:
+            config["guilds"] = guilds
+        return config
+
+
 class OpenClawSpec(BaseModel):
     lead_agent_id: str = Field(default="main", pattern=r"^[a-z][a-z0-9_-]*$")
     subagents: SubagentSpec | None = None
     a2a: A2ASpec = Field(default_factory=A2ASpec)
     mcp_servers: dict[str, McpServerSpec] = Field(default_factory=dict)
+    discord: DiscordSpec | None = None
 
     @field_validator("mcp_servers")
     @classmethod
@@ -573,6 +739,8 @@ class Inventory(BaseModel):
     services: list[ServiceSpec] = Field(default_factory=list)
     # ADR-004: path of the private runtime pin overlay; load_inventory() resolves and applies it.
     runtime_pins: str | None = None
+    # ADR-005: path of the operator-written site values file; resolved and substituted on load.
+    site_values: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -640,6 +808,8 @@ class Inventory(BaseModel):
 
         if self.version != 1 and self.runtime_pins is not None:
             raise ValueError(RUNTIME_PINS_V1_ONLY)
+        if self.version != 1 and self.site_values is not None:
+            raise ValueError(SITE_VALUES_V1_ONLY)
         if self.version == 1:
             if self.services or any(item.depends_on for item in self.instances):
                 raise ValueError("Services and dependencies require inventory version 2")
@@ -816,7 +986,8 @@ class Inventory(BaseModel):
 
 def _expand_string_values(value: object, env: Mapping[str, str]) -> object:
     def _expand_with_env(text: str) -> str:
-        pattern = re.compile(r"\$(\w+)|\$\{([^}]+)\}")
+        # ``${site:<name>}`` is a site value reference (ADR-005), never an env lookup.
+        pattern = re.compile(r"\$(\w+)|\$\{(?!site:)([^}]+)\}")
 
         def _replace(match: re.Match[str]) -> str:
             key = match.group(1) or match.group(2)
@@ -840,7 +1011,11 @@ RUNTIME_PINS_V1_ONLY = (
 
 @dataclass(frozen=True)
 class InventoryLayers:
-    """An inventory as loaded: raw expanded data, optional runtime pin overlay, effective model."""
+    """An inventory as loaded: expanded and site-substituted data, pin overlay, effective model.
+
+    ``raw`` is the inventory after ``${VAR}`` expansion and ``${site:…}`` substitution
+    (ADR-005), before the runtime pin overlay (ADR-004).
+    """
 
     inventory_path: Path
     raw: dict
@@ -848,6 +1023,7 @@ class InventoryLayers:
     overlay: dict | None
     merged: dict
     inventory: Inventory
+    site: SiteSubstitution | None = None
 
 
 def _expanded_inventory_data(inventory_path: Path) -> dict:
@@ -875,16 +1051,52 @@ def _expanded_inventory_data(inventory_path: Path) -> dict:
     return expanded
 
 
+def _substituted_inventory_data(
+    expanded: dict, inventory_path: Path
+) -> tuple[dict, SiteSubstitution | None]:
+    """Replace whole-string ``${site:<name>}`` references (ADR-005 item 2)."""
+    reference = expanded.get("site_values")
+    if reference is None:
+        # Without a site values file any reference is an error; the data stays unchanged.
+        substitute_references(expanded, None, None)
+        return expanded, None
+    if expanded.get("version", 1) != 1:
+        raise ValueError(SITE_VALUES_V1_ONLY)
+    if not isinstance(reference, str) or not reference.strip():
+        raise SiteValuesError("site_values must be a non-empty path")
+    if "${site:" in reference:
+        raise SiteValuesError("site_values: the path cannot be a site value reference")
+    site_path = resolve_pins_path(reference, inventory_path)
+    values = validate_site_values(read_site_values_file(site_path), expanded, site_path)
+    substituted, references = substitute_references(expanded, values, site_path)
+    substituted["site_values"] = str(site_path)
+    return substituted, SiteSubstitution(site_path, values, references)
+
+
+def _validated_inventory(data: dict, site: SiteSubstitution | None) -> Inventory:
+    try:
+        return Inventory.model_validate(data)
+    except ValidationError as exc:
+        hint = explain_validation_error(exc, site.references) if site is not None else None
+        if hint is None:
+            raise
+        raise SiteValuesError(f"{exc}\n{hint}") from exc
+
+
 def load_inventory_layers(path: str | Path, *, allow_missing_pins: bool = False) -> InventoryLayers:
-    """Load an inventory and apply its runtime pin overlay (ADR-004) before validation.
+    """Load an inventory: ``${VAR}`` expansion, site values (ADR-005), runtime pins (ADR-004).
 
     ``allow_missing_pins`` is reserved for the migration command (``clawake pins init``).
     """
     inventory_path = Path(path)
-    raw = _expanded_inventory_data(inventory_path)
+    raw, site = _substituted_inventory_data(
+        _expanded_inventory_data(inventory_path), inventory_path
+    )
     reference = raw.get("runtime_pins")
     if reference is None:
-        return InventoryLayers(inventory_path, raw, None, None, raw, Inventory.model_validate(raw))
+        return InventoryLayers(
+            inventory_path, raw, None, None, raw, _validated_inventory(raw, site), site
+        )
     if raw.get("version", 1) != 1:
         raise ValueError(RUNTIME_PINS_V1_ONLY)
     if not isinstance(reference, str) or not reference.strip():
@@ -893,13 +1105,13 @@ def load_inventory_layers(path: str | Path, *, allow_missing_pins: bool = False)
     if allow_missing_pins and not os.path.lexists(pins_path):
         merged = {**raw, "runtime_pins": str(pins_path)}
         return InventoryLayers(
-            inventory_path, raw, pins_path, None, merged, Inventory.model_validate(merged)
+            inventory_path, raw, pins_path, None, merged, _validated_inventory(merged, site), site
         )
     overlay = validate_overlay(read_overlay_file(pins_path), raw, pins_path)
     merged = apply_overlay(raw, overlay, inventory_source=inventory_path, overlay_source=pins_path)
     merged["runtime_pins"] = str(pins_path)
     return InventoryLayers(
-        inventory_path, raw, pins_path, overlay, merged, Inventory.model_validate(merged)
+        inventory_path, raw, pins_path, overlay, merged, _validated_inventory(merged, site), site
     )
 
 
