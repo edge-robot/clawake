@@ -151,6 +151,47 @@ replace an explicit image USER. `read_only: true` makes the image filesystem
 read-only while declared writable data mounts remain writable. Internal curl
 health probes use --noproxy to reach their own service DNS directly.
 
+## Member readiness (`readiness`, v1 members)
+
+Each instance may set an optional `readiness` block. `clawake status` and
+`status --wait` use it (ADR-003); v2 resource status is unchanged.
+
+```yaml
+instances:
+  - name: example-lead
+    # ...
+    health: {path: /readyz, timeout_seconds: 5}   # defaults
+    readiness:
+      channels: false              # default; opt-in channel lifecycle check
+      start_window_seconds: 180    # default; bound for status --wait (1..3600)
+```
+
+- `health.path` now defaults to `/readyz`. OpenClaw keeps `/readyz` red while startup
+  plugin sidecars, channels or hooks are still settling; `/healthz` is liveness only.
+  `upgrade` waits on the same path, so it is stricter than with the old `/health`
+  default. `HealthSpec` is not rendered into v1 Quadlets.
+- `readiness.channels: true` adds `podman exec <container> openclaw channels status --json`
+  to the probe. It reads the gateway's recorded channel lifecycle only; Clawake never
+  passes `--probe`.
+- `readiness.start_window_seconds` bounds `status --wait`; `--timeout <s>` overrides it.
+
+States, evaluated in this order:
+
+| State | Rule |
+|---|---|
+| `stopped` | the unit is inactive, dead or not loaded |
+| `failed` | the unit failed (or waits for an automatic restart), its state is unknown, or `--wait` ran out before `ready`/`degraded` |
+| `starting` | the unit is active or activating and `GET <gateway>/readyz` is not 200, refused or timed out |
+| `degraded` | `/readyz` is 200, but a pinned plugin is missing from `openclaw plugins list --json`, not `enabled`, not `status: loaded`, or its `version` differs from the pinned package version (`package/package.json` in the archive, or the npm spec version); or, with `channels: true`, a channel account reports `running: false` or a `lifecycle` other than `running`; or any of these outputs could not be parsed |
+| `ready` | none of the above |
+
+Every non-`ready` state carries snake_case `reasons` with a short sanitized detail.
+Probes are read-only: one HTTP GET from the host to the published gateway port (no
+proxy), and the `podman exec ... openclaw ... --json` commands above, each with a timeout
+of at most 10 s. Raw command output, container environment and tokens are never printed.
+OpenClaw's `plugins list --json` has no integrity field, so `degraded` compares versions,
+not sha256 digests.
+
 ## MCP server models and the conflict rule
 
 Two inventory models provision OpenClaw's native MCP client configuration

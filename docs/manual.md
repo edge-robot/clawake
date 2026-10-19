@@ -226,3 +226,30 @@ eine Migration ist ein vollständiges, geprüftes Offline-Backup erforderlich.
 `clawake stop -c INVENTAR [--member NAME]` zeigt die Vorschau; `--execute` hält
 die ausgewählten Dienste an und erhält Daten und Quadlets. Für den MCP-Dienst
 entsprechend `clawake onshape-mcp -c SERVICE --action stop [--execute]`.
+
+## Member readiness and `status`
+
+`status` reports one readiness state per v1 member: `stopped`, `starting`, `ready`,
+`degraded` or `failed`. The rules, the probes and the inventory field `readiness` are
+described in [inventory-v2.md](inventory-v2.md#member-readiness-readiness-v1-members).
+
+```bash
+uv run clawake status -c personal-team/team.yml -m pflegebetreuer
+uv run clawake status -c personal-team/team.yml --wait
+uv run clawake status -c personal-team/team.yml --wait --timeout 300 --format json
+```
+
+- Text output adds `readiness=<state>` to each member line, one `reason: <code>: <detail>`
+  line per reason, one `plugin:` line per pinned plugin, and a `WARNING: degraded` line.
+- JSON keeps all previous keys and adds `readiness`, `reasons` (`[{code, detail}]`) and
+  `plugins` (`[{id, pinned_version, installed_version, status, enabled}]`) per instance.
+  The old `state` key (`healthy`/`failed`, systemd only) is deprecated in favour of
+  `readiness`.
+- `--wait` polls every 2 s until each selected member is `ready` or `degraded`, or until
+  its `readiness.start_window_seconds` (default 180 s) has passed; `--timeout <s>`
+  overrides the window. Members still not settled become `failed` with reason
+  `start_window_exceeded`; stopped members stay `stopped`. `--timeout` requires `--wait`.
+  v2 inventories reject both options.
+- Exit code: 1 if any member is `stopped` or `failed`; with `--wait` also if any member
+  is not `ready` or `degraded` at the end. `degraded` alone exits 0.
+- `status` is read-only. It never starts, restarts or installs anything.
