@@ -229,3 +229,142 @@ Options considered:
 - The overlay is a single point of truth for "what is deployed". Its backups replace hand
   backups of `team.json`.
 - The Candidate ID remains in the inventory until clawonshape#11 P4 removes it there.
+
+## ADR-005: Discord channel provisioning from the inventory and private site values
+
+Status: Accepted (2026-10-19, user decision). Tracks edge-robot/clawake#26; folds in #21 (M22).
+Prerequisite for removing the `openclaw config patch` workaround from the ClawOnshape
+onboarding runbook.
+
+### Context
+
+- `channels.discord` of the deployed members exists only in their private runtime
+  `openclaw.json`. It was written by hand, is never versioned, and is lost on a fresh
+  machine. Clawake owns only `channels/a2a/*` (ADR-001 ledger).
+- Live key paths (read 2026-10-19, values not read), Lead and Engineer alike:
+  `enabled`, `groupPolicy`, `guilds.<id>.channels.<id>.enabled`, `token`. The `token` is a
+  plaintext **string** on both members, including the member where Discord is disabled.
+  The file is rewritten by Clawake and OpenClaw and is part of the member backups.
+- No `users`/`roles` allowlist and no explicit `dmPolicy`/`allowFrom` (#21). The proof-based
+  mutation release (edge-robot/clawonshape#11) relies on the channel's sender allowlist.
+- The IDs involved (guild, channel, user, role, application) are not secrets, but they are
+  private. They must not enter this public repository or a versioned inventory.
+- OpenClaw facts (docs.openclaw.ai, fetched 2026-10-19; docs only, not live-verified):
+  - `/channels/discord/setup`: `channels.discord.token` accepts a SecretRef
+    `{source: "env", provider: "default", id: "<VAR>"}`; config values win over the
+    `DISCORD_BOT_TOKEN` env fallback; `applicationId` skips the startup lookup;
+    `accounts.<id>` exists for several bots.
+  - `/channels/discord/access-control`: `dmPolicy` is `pairing` (default), `allowlist`,
+    `open` or `disabled`; `allowFrom` is the DM allowlist. `groupPolicy` is `open`,
+    `allowlist` or `disabled`. Guilds are keyed by ID; per guild and per channel:
+    `requireMention`, `users` (IDs recommended; names need `dangerouslyAllowNameMatching`),
+    `roles` (IDs only). A guild with a `channels` map denies unlisted channels.
+  - Config rewrites by OpenClaw: `doctor --fix` migrates the legacy keys `dm.policy`,
+    `dm.allowFrom` and per-channel `allow`. Pairing approvals are stored in the state
+    database (`channel_pairing_allow_entries`), not in `openclaw.json`. Explicit
+    `openclaw config patch` and agent-driven config edits write the file.
+
+Options considered for the private values:
+
+- **(A)** a second private file, `site_values`, written only by the operator;
+- **(B)** a section in the runtime pin overlay (ADR-004);
+- **(C)** host environment variables through the existing `${VAR}` expansion.
+
+(B) mixes two writers and lifecycles: Clawake rewrites pins on every rollout and keeps 20
+backups; site values change once per site. `pins show` and pin rollback would carry site
+data. (C) is not reviewable, not validated and differs per shell.
+
+### Decision
+
+1. **Site values file (option A).** A v1 inventory may declare `site_values: <path>`
+   (resolved like `runtime_pins`). Format:
+   ```json
+   {"version": 1, "cluster": "<cluster.name>", "values": {"<name>": "<string>" | ["<string>", ...]}}
+   ```
+   - Names match `^[a-z0-9][a-z0-9_.-]*$`. Unknown top-level keys and a `cluster`
+     mismatch are rejected.
+   - The operator writes the file; **Clawake never writes it.** Loading refuses a group- or
+     world-writable file and warns if it is group- or world-readable (ADR-004 rules).
+   - It never holds secrets. Tokens stay in member env files.
+   - v2 rejects `site_values` until v2 rollout exists.
+2. **References.** Any inventory string may be exactly `${site:<name>}`. The reference is
+   replaced by the site value (a string, or a list of strings where the field is a list)
+   after `${VAR}` expansion and before the runtime pin overlay and model validation.
+   - A partial reference (`"x-${site:a}"`) is an error, so IDs are never concatenated.
+   - An unknown name fails loading; an unused value is a warning in `validate`.
+   - Substitution is generic: it also applies to plugin `config`, so the approver set can
+     come from the same value as the channel allowlist (#21). Whether ClawOnshape consumes
+     it there is ClawOnshape's decision (see *Open decisions*).
+3. **Discord model, per member.** Optional `openclaw.discord` block:
+   ```yaml
+   discord:
+     enabled: true
+     token_env: DISCORD_BOT_TOKEN        # name only, never a value
+     application_id: ${site:discord.application_id}   # optional
+     dm_policy: disabled                 # disabled | allowlist | pairing; no "open"
+     allow_from: ${site:discord.dm_allow}            # required iff dm_policy=allowlist
+     group_policy: allowlist             # allowlist | disabled; no "open"
+     guilds:
+       - id: ${site:discord.guild}
+         require_mention: true
+         users: []                       # guild defaults, optional
+         roles: []
+         channels:
+           - id: ${site:discord.lead_channel}
+             require_mention: true
+             users: ${site:discord.approvers}
+   ```
+   - Guilds and channels are lists with an `id` field, so IDs are never mapping keys in a
+     versioned file. Duplicate IDs are rejected.
+   - After substitution every `id`, `users`, `roles` and `allow_from` entry must be a
+     numeric Discord snowflake. Names, tags, `*` and `dangerouslyAllowNameMatching` are
+     not offered.
+   - With `group_policy: allowlist`, every enabled channel needs a non-empty `users` or
+     `roles` list, its own or inherited from the guild (#21: no channel open to the whole
+     guild).
+   - `enabled: false` renders only `{"enabled": false}`; all other keys are rejected.
+   - Default account only. `accounts.<id>` is out of scope.
+4. **Rendering and ownership.** Clawake renders the whole `channels.discord` object as
+   **one** ledger-owned field `channels/discord` (ADR-001):
+   - `token` is always `{source: "env", provider: "default", id: <token_env>}`;
+   - keys are rendered in OpenClaw's current names only, so `doctor --fix` has nothing to
+     migrate;
+   - any change inside the object made outside Clawake (config patch, agent edit) trips the
+     drift guard. Pairing approvals do not, because they live in the state database.
+   - `setup` checks that `token_env` is declared as a key in the member's env file. It
+     parses key names only and never reads, prints or stores the value.
+   - A member without a `discord` block: Clawake leaves `channels.discord` untouched and
+     unowned (unchanged behaviour).
+5. **Named one-time adoption `discord-channel`.** An existing, not-yet-owned
+   `channels.discord` is taken over only when `setup` is given `--adopt discord-channel`.
+   - **Precondition, fail closed:** the live `token` must not be a string. If it is,
+     `setup` stops with an instruction for the operator: move the token into the member
+     env file under `token_env` and replace the field with the SecretRef. The message
+     never contains the value. Clawake never reads, moves or deletes a token value.
+   - The preview lists the key paths that are added, removed and changed. IDs are
+     redacted as `<id>`; no values are printed.
+   - `--execute` takes the member backup first, then replaces the object and records
+     ownership.
+   - Without the flag, an unowned existing object is a preview error naming the rule.
+6. **Acceptance.** After rendering, the P1 opt-in probe `readiness.channels` must report
+   the Discord account `ready` for every member with `enabled: true`.
+
+### Consequences
+
+- A fresh machine needs the inventory, the site values file and the member env files.
+  The onboarding runbook loses its `openclaw config patch` step.
+- Operators edit Discord access in the site values file and run `setup`. A change made
+  through the OpenClaw UI or an agent blocks the next `setup` until it is moved into the
+  site values file or reverted, as intended by ADR-001.
+- Public evidence and issues refer to site value **names**, never to values.
+- The disabled member stops carrying a plaintext token copy once adopted.
+
+### Open decisions
+
+- **ClawOnshape bindings** (`requesterSenderId`, `discordChannelId`, approver set):
+  either ClawOnshape's plugin `config` uses `${site:…}` references, or the plugin reads
+  the binding from the rendered channel config. Owned by edge-robot/clawonshape
+  (#11 P4); Clawake only provides the substitution.
+- **OpenClaw config rewrites** are documented, not live-verified. Before #24 relies on
+  unattended `rollout`, verify on the deployed OpenClaw version that a pairing approval
+  and a gateway restart leave `channels.discord` byte-identical.
