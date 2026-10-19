@@ -436,6 +436,24 @@ def test_restart_quadlets_execute_propagates_failures(monkeypatch: object, tmp_p
     assert result.exit_code == 1
 
 
+def _fake_readiness_seams(monkeypatch: object, *, readyz_status: int) -> None:
+    """Keep status tests off the network: /readyz and podman exec are fakes."""
+    from clawake import cli
+    from clawake.services.readiness import HttpOutcome, ReadinessProbes
+
+    def probes(service: object) -> ReadinessProbes:
+        def run(argv: list[str], timeout: float) -> CommandResult:
+            raise AssertionError(f"unexpected probe command {argv}")
+
+        return ReadinessProbes(
+            unit_status=lambda name: service.status(name, execute=True),
+            run=run,
+            http_get=lambda url, timeout: HttpOutcome(status=readyz_status),
+        )
+
+    monkeypatch.setattr(cli, "default_probes", probes)
+
+
 def test_status_quadlets_json_healthy(monkeypatch: object, tmp_path: Path) -> None:
     from clawake import cli
 
@@ -458,12 +476,14 @@ def test_status_quadlets_json_healthy(monkeypatch: object, tmp_path: Path) -> No
 
     cfg, _env_file, _workspace = _write_inventory(tmp_path)
     monkeypatch.setattr(cli, "SystemdService", HealthySystemdService)
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
 
     result = runner.invoke(app, ["status-quadlets", "--config", str(cfg), "--format", "json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["instances"][0]["state"] == "healthy"
+    assert payload["instances"][0]["readiness"] == "ready"
     assert payload["instances"][0]["unit"] == "one.service"
 
 
@@ -489,11 +509,12 @@ def test_status_quadlets_text_prints_diagnostic_cause(monkeypatch: object, tmp_p
 
     cfg, _env_file, _workspace = _write_inventory(tmp_path)
     monkeypatch.setattr(cli, "SystemdService", FailedSystemdService)
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
 
     result = runner.invoke(app, ["status-quadlets", "--config", str(cfg), "--format", "text"])
 
     assert result.exit_code == 1
-    assert "state=failed rc=3" in result.output
+    assert "state=failed rc=3 readiness=failed" in result.output
     assert "cause: EnvironmentFile missing" in result.output
 
 

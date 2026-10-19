@@ -151,10 +151,18 @@ class PluginSpec(BaseModel):
 
 
 class HealthSpec(BaseModel):
-    path: str = "/health"
+    # ADR-003: /readyz stays red while plugins, channels or hooks settle; /healthz is liveness.
+    path: str = "/readyz"
     interval_seconds: int = 30
     timeout_seconds: int = 5
     retries: int = 3
+
+
+class ReadinessSpec(BaseModel):
+    """Per-member readiness probing (ADR-003); read-only, used by status --wait."""
+
+    channels: bool = False
+    start_window_seconds: int = Field(default=180, ge=1, le=3600)
 
 
 class UpdatePolicy(BaseModel):
@@ -436,6 +444,7 @@ class InstanceSpec(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     public_url: str | None = None
     health: HealthSpec = Field(default_factory=HealthSpec)
+    readiness: ReadinessSpec = Field(default_factory=ReadinessSpec)
     update_policy: UpdatePolicy = Field(default_factory=UpdatePolicy)
     backup_policy: BackupPolicy = Field(default_factory=BackupPolicy)
     gateway_runtime: GatewayRuntimeSpec = Field(default_factory=GatewayRuntimeSpec)

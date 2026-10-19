@@ -18,6 +18,13 @@ from clawake.services.gateway_config import (
 )
 from clawake.services.image_check import ImageCheckError, check_image_availability
 from clawake.services.plugins import sync_plugin
+from clawake.services.readiness import (
+    SETTLED_STATES,
+    MemberReadiness,
+    default_probes,
+    probe_member,
+    wait_members_ready,
+)
 from clawake.services.runtime_upgrade import (
     doctor_command,
     ensure_browser_cache,
@@ -713,32 +720,66 @@ def restart_quadlets(
         raise typer.Exit(code=1)
 
 
+WaitFlag = Annotated[
+    bool,
+    typer.Option(
+        "--wait",
+        help="Poll until every selected member is ready or degraded, bounded by the "
+        "member's readiness.start_window_seconds.",
+    ),
+]
+WaitTimeout = Annotated[
+    int | None,
+    typer.Option(
+        "--timeout",
+        min=1,
+        max=3600,
+        help="Override the start window in seconds for --wait.",
+    ),
+]
+
+
 @app.command("status-quadlets")
 def status_quadlets(
     config: ConfigPath,
     member: OptionalMemberName = None,
     service_name: OptionalServiceName = None,
     format: StatusFormat = "text",
+    wait: WaitFlag = False,
+    timeout: WaitTimeout = None,
 ) -> None:
-    """Aggregate per-member runtime status with optional machine-readable output."""
+    """Aggregate per-member runtime status and readiness with optional JSON output."""
+    # Architecture-Ref: clawake/docs/architecture.md#ownership-and-isolation
+    # The doc still says status represents systemd state only; ADR-003 adds readiness.
     inventory = _load(config, validation_only=True)
     if inventory.version == 2:
+        if wait or timeout is not None:
+            raise typer.BadParameter("--wait and --timeout are only supported for v1 members")
         _v2_operation(inventory, "status", member, service_name, False, format)
         return
     if service_name:
         raise typer.BadParameter("Services require inventory v2")
+    if timeout is not None and not wait:
+        raise typer.BadParameter("--timeout requires --wait", param_hint="--timeout")
     selected = _select_instances(inventory, member)
     service = SystemdService()
+    probes = default_probes(service)
+    if wait:
+        readiness = wait_members_ready(selected, timeout=timeout, probes=probes)
+    else:
+        readiness = [probe_member(instance, probes) for instance in selected]
     rows: list[dict[str, object]] = []
 
-    for instance in selected:
-        result = service.status(instance.name, execute=True)
+    for instance, member_readiness in zip(selected, readiness, strict=True):
+        result = member_readiness.unit_result
+        assert result is not None
         diagnostics = None
         if _status_needs_diagnostics(result):
             diagnostics = _status_diagnostics(service, instance.name)
         row = {
             "instance": instance.name,
             "role": instance.role,
+            # Deprecated: systemctl-only view; use "readiness" (ADR-003).
             "state": _status_state(result),
             "return_code": result.return_code,
             "unit": service.unit_name(instance.name),
@@ -751,6 +792,9 @@ def status_quadlets(
                 if diagnostics
                 else ""
             ),
+            "readiness": member_readiness.state,
+            "reasons": [reason.to_json() for reason in member_readiness.reasons],
+            "plugins": [plugin.to_json() for plugin in member_readiness.plugins],
         }
         rows.append(row)
 
@@ -767,10 +811,21 @@ def status_quadlets(
         )
     else:
         typer.echo(f"Cluster: {inventory.cluster.name} ({inventory.cluster.mode})")
-        for row in rows:
+        for row, member_readiness in zip(rows, readiness, strict=True):
             typer.echo(
-                f"- {row['instance']} [{row['role']}] state={row['state']} rc={row['return_code']}"
+                f"- {row['instance']} [{row['role']}] state={row['state']} "
+                f"rc={row['return_code']} readiness={member_readiness.state}"
             )
+            if member_readiness.state == "degraded":
+                typer.echo("  WARNING: degraded; the gateway is ready but checks below failed")
+            for reason in member_readiness.reasons:
+                typer.echo(f"  reason: {reason.code}: {reason.detail}")
+            for plugin in member_readiness.plugins:
+                typer.echo(
+                    f"  plugin: {plugin.id} pinned={plugin.pinned_version or '-'} "
+                    f"installed={plugin.installed_version or '-'} "
+                    f"status={plugin.status or '-'} enabled={_tri_state(plugin.enabled)}"
+                )
             diagnostics_summary = _diagnostic_summary(
                 CommandResult(command=[], return_code=0, stdout=str(row["diagnostics"]), stderr="")
                 if row["diagnostics"]
@@ -779,8 +834,23 @@ def status_quadlets(
             if diagnostics_summary:
                 typer.echo(f"  cause: {diagnostics_summary}")
 
-    if any(int(row["return_code"]) != 0 for row in rows):
+    if _status_exit_code(readiness, waited=wait):
         raise typer.Exit(code=1)
+
+
+def _tri_state(value: bool | None) -> str:
+    if value is None:
+        return "-"
+    return "yes" if value else "no"
+
+
+def _status_exit_code(readiness: list[MemberReadiness], *, waited: bool) -> int:
+    """Non-zero for stopped/failed; after --wait also for anything not ready/degraded."""
+    if any(item.state in {"stopped", "failed"} for item in readiness):
+        return 1
+    if waited and any(item.state not in SETTLED_STATES for item in readiness):
+        return 1
+    return 0
 
 
 @app.command("teardown-quadlets")
