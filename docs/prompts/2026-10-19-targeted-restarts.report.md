@@ -1,7 +1,7 @@
 ---
 prompt: docs/prompts/2026-10-19-targeted-restarts.md
 branch: feat/5-targeted-restarts
-commits: 33b9475..<report-commit>
+commits: 33b9475..1236a1d (implementation; prompt and report follow in 4bebc09)
 status: done
 e2e-request: required
 ---
