@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from clawake.cli import app
 from clawake.config import Inventory, load_inventory
 from clawake.services.deployment import apply_artifacts, plan_deployment
+from clawake.services.readiness import HttpOutcome, ReadinessProbes
 from clawake.services.render import render_inventory
 from clawake.services.runtime_config import STATE_FILE
 from clawake.services.systemd import CommandResult
@@ -330,7 +331,15 @@ def test_upgrade_replans_after_migration_and_preserves_operator_settings(
     monkeypatch.setattr(cli, "SystemdService", Service)
     monkeypatch.setattr(cli, "check_image_availability", lambda image: None)
     monkeypatch.setattr(cli, "run_doctor", migrate)
-    monkeypatch.setattr(cli, "wait_for_health", lambda instance: (True, "healthy"))
+    monkeypatch.setattr(
+        cli,
+        "default_probes",
+        lambda service: ReadinessProbes(
+            unit_status=lambda name: CommandResult([], 0, "Active: active (running)", ""),
+            run=lambda argv, timeout: CommandResult(argv, 0, '{"plugins": []}', ""),
+            http_get=lambda url, timeout: HttpOutcome(status=200),
+        ),
+    )
     monkeypatch.setattr(
         cli,
         "verify_runtime",

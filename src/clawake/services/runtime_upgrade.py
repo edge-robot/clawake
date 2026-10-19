@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import re
 import subprocess
-import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,25 +72,6 @@ def run_doctor(instance: InstanceSpec, image: ImageSpec) -> subprocess.Completed
     return subprocess.run(
         doctor_command(instance, image), check=False, capture_output=True, text=True
     )
-
-
-def wait_for_health(instance: InstanceSpec) -> tuple[bool, str]:
-    base_url = _gateway_host_url(instance).rstrip("/")
-    health_url = f"{base_url}/{instance.health.path.lstrip('/')}"
-    last_error = "health check did not run"
-    for attempt in range(instance.health.retries):
-        try:
-            with urllib.request.urlopen(
-                health_url, timeout=instance.health.timeout_seconds
-            ) as response:
-                if 200 <= response.status < 300:
-                    return True, health_url
-                last_error = f"HTTP {response.status} from {health_url}"
-        except (OSError, urllib.error.URLError) as exc:
-            last_error = f"{health_url}: {exc}"
-        if attempt + 1 < instance.health.retries:
-            time.sleep(instance.health.interval_seconds)
-    return False, last_error
 
 
 def verify_runtime(instance: InstanceSpec, expected: ImageSpec) -> RuntimeCheck:

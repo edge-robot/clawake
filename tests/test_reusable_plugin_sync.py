@@ -11,6 +11,26 @@ from clawake.cli import app
 from clawake.config import PluginSpec, load_inventory
 from clawake.services.deployment import apply_artifacts, plan_deployment
 from clawake.services.gateway_config import ensure_plugin_runtime_config
+from clawake.services.readiness import HttpOutcome, ReadinessProbes
+from clawake.services.systemd import CommandResult
+
+
+def _ready_probes(monkeypatch) -> None:
+    """Members answer /readyz 200 with no plugins installed; npm inspect finds nothing."""
+
+    def run(argv: list[str], timeout: float) -> CommandResult:
+        if argv[-3:-1] == ["plugins", "list"]:
+            return CommandResult(argv, 0, '{"plugins": []}', "")
+        return CommandResult(argv, 1, "", "not installed")
+
+    monkeypatch.setattr(
+        "clawake.cli.default_probes",
+        lambda service: ReadinessProbes(
+            unit_status=lambda name: CommandResult([], 0, "Active: active (running)", ""),
+            run=run,
+            http_get=lambda url, timeout: HttpOutcome(status=200),
+        ),
+    )
 
 
 @pytest.fixture
@@ -46,6 +66,7 @@ def test_sync_without_plugins_revokes_only_managed_grants_and_preview_is_inert(
     runtime = Mock()
     runtime.restart.return_value = SimpleNamespace(return_code=0, stdout="", stderr="", command=[])
     monkeypatch.setattr("clawake.cli.SystemdService", lambda: runtime)
+    _ready_probes(monkeypatch)
     preview = CliRunner().invoke(app, ["sync-plugins", "-c", str(config)])
     assert preview.exit_code == 0, preview.output
     assert config_path.read_bytes() == before
@@ -77,10 +98,11 @@ def test_failed_plugin_install_does_not_restart_or_reconcile_member(configured, 
             raise RuntimeError("installation_failed")
         return SimpleNamespace(digest="sha512-dGVzdA==", commands=[])
 
-    monkeypatch.setattr("clawake.cli.sync_plugin", sync)
+    monkeypatch.setattr("clawake.services.member_ops.sync_plugin", sync)
     runtime = Mock()
     runtime.restart.return_value = SimpleNamespace(return_code=0, stdout="", stderr="", command=[])
     monkeypatch.setattr("clawake.cli.SystemdService", lambda: runtime)
+    _ready_probes(monkeypatch)
     applied = CliRunner().invoke(
         app, ["sync-plugins", "-c", str(config), "-m", instance.name, "--execute"]
     )

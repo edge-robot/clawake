@@ -159,7 +159,7 @@ class HealthSpec(BaseModel):
 
 
 class ReadinessSpec(BaseModel):
-    """Per-member readiness probing (ADR-003); read-only, used by status --wait."""
+    """Per-member readiness probing (ADR-003); bounds the waits of status, setup, sync, upgrade."""
 
     channels: bool = False
     start_window_seconds: int = Field(default=180, ge=1, le=3600)

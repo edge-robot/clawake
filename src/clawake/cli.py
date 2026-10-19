@@ -13,11 +13,15 @@ from clawake.config import ImageSpec, InstanceSpec, Inventory, load_inventory
 from clawake.inventory_validation import require_v1_runtime
 from clawake.services.backup import backup_instance, prune_backups
 from clawake.services.deployment import ArtifactChange, apply_artifacts, plan_deployment
-from clawake.services.gateway_config import (
-    ensure_plugin_runtime_config,
-)
 from clawake.services.image_check import ImageCheckError, check_image_availability
-from clawake.services.plugins import sync_plugin
+from clawake.services.member_ops import (
+    plan_member_plugins,
+    plan_setup_actions,
+    plugin_sync_summary,
+    run_plugin_sync,
+    run_setup_actions,
+    setup_summary,
+)
 from clawake.services.readiness import (
     SETTLED_STATES,
     MemberReadiness,
@@ -31,7 +35,6 @@ from clawake.services.runtime_upgrade import (
     is_browser_image,
     run_doctor,
     verify_runtime,
-    wait_for_health,
 )
 from clawake.services.systemd import CommandResult, SystemdService
 from clawake.services.upgrade import apply_upgrade, backup_config, build_upgrade_plan
@@ -111,17 +114,30 @@ def sync_plugins(
     selected = _select_instances(inventory, member)
     declared = [(instance, plugin) for instance in selected for plugin in instance.plugins]
     typer.echo(f"Plugin sync plan for {len(declared)} pinned plugin(s)")
-    plans = []
+    service = SystemdService()
+    probes = default_probes(service)
+    restarts: list[str] = []
     try:
-        for instance, plugin in declared:
-            result = sync_plugin(instance, plugin, execute=False)
-            plans.append((instance, plugin, result))
-            typer.echo(f" - {instance.name}: {plugin.id} ({result.digest})")
-            if plugin.source_type == "archive":
-                typer.echo(f"   mount: {plugin.artifact_path} -> {plugin.container_path}:ro")
-            else:
-                typer.echo(f"   npm: {plugin.npm_spec}")
         for instance in selected:
+            # Read-only: one readiness probe, the install ledger and the config diff.
+            plan = plan_member_plugins(instance, probes)
+            if plan.readiness is not None:
+                typer.echo(f" - {instance.name}: readiness={plan.readiness.state}")
+            for plugin, decision in zip(instance.plugins, plan.decisions, strict=True):
+                typer.echo(f" - {instance.name}: {plugin.id} ({decision.digest})")
+                if plugin.source_type == "archive":
+                    typer.echo(f"   mount: {plugin.artifact_path} -> {plugin.container_path}:ro")
+                else:
+                    typer.echo(f"   npm: {plugin.npm_spec}")
+                typer.echo(f"   version: {decision.pinned_version or 'unreadable'}")
+                reasons = f" ({', '.join(decision.reasons)})" if decision.reasons else ""
+                typer.echo(f"   action: {decision.action}{reasons}")
+            if plan.config_changed:
+                typer.echo(f" - {instance.name}: managed plugin config would change")
+            if plan.restart_expected:
+                restarts.append(instance.name)
+            elif plan.restart_possible:
+                restarts.append(f"{instance.name} (if install)")
             if instance.global_tool_allow:
                 typer.echo(
                     f" - {instance.name}: explicit global tools "
@@ -134,6 +150,7 @@ def sync_plugins(
     except (OSError, ValueError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
+    typer.echo(f"Members to restart: {', '.join(restarts) or 'none'}")
 
     if not execute:
         typer.echo(
@@ -142,41 +159,14 @@ def sync_plugins(
         )
         return
 
-    service = SystemdService()
-    failed = False
-    restart_instances: dict[str, InstanceSpec] = {}
-    failed_instances: set[str] = set()
-    for instance, plugin, _result in plans:
-        try:
-            result = sync_plugin(instance, plugin, execute=True)
-            for command in result.commands:
-                typer.echo(f"$ {' '.join(command)}")
-            typer.echo(f"Installed verified plugin {plugin.id} on {instance.name}")
-            restart_instances[instance.name] = instance
-        except (OSError, RuntimeError, ValueError) as exc:
-            typer.echo(str(exc), err=True)
-            failed = True
-            failed_instances.add(instance.name)
-            continue
-    for instance in selected:
-        if instance.name in failed_instances:
-            continue
-        try:
-            config_path, config_changed = ensure_plugin_runtime_config(instance)
-            if config_changed:
-                typer.echo(f"Updated managed plugin config and agent ACLs in {config_path}")
-                restart_instances[instance.name] = instance
-        except (OSError, RuntimeError, ValueError) as exc:
-            typer.echo(str(exc), err=True)
-            failed = True
-            failed_instances.add(instance.name)
-    for instance in restart_instances.values():
-        if instance.name in failed_instances:
-            continue
-        restart_result = service.restart(instance.name, execute=True)
-        _print_result(restart_result)
-        failed = failed or restart_result.return_code != 0
+    rows, failed = run_plugin_sync(
+        selected, service, probes, echo=typer.echo, on_result=_print_result
+    )
+    typer.echo("Plugin sync summary:")
+    for line in plugin_sync_summary(rows):
+        typer.echo(line)
     if failed:
+        typer.echo("Plugin sync stopped at the first failing member.", err=True)
         raise typer.Exit(code=1)
 
 
@@ -379,6 +369,7 @@ def upgrade_member(
     typer.echo(f"  backup: {'yes' if instance.backup_policy.pre_mutation else 'no'}")
     typer.echo(f"  migration: {' '.join(doctor_command(instance, target)[-5:])}")
     typer.echo(f"  health: {_dashboard_host_url(instance).rstrip('/')}{instance.health.path}")
+    typer.echo(f"  readiness wait: up to {instance.readiness.start_window_seconds}s")
     _print_plan(changes)
     if not execute:
         typer.echo("DRY RUN upgrade complete. Re-run with --execute to mutate state.")
@@ -437,9 +428,17 @@ def upgrade_member(
         if restart_result.return_code != 0:
             raise RuntimeError(restart_result.stderr or "service restart failed")
 
-        healthy, health_details = wait_for_health(updated_instance)
-        if not healthy:
-            raise RuntimeError(f"health check failed: {health_details}")
+        # ADR-003: wait on readiness for the whole start window, not a fixed retry count.
+        probes = default_probes(service)
+        wait_started = probes.clock()
+        readiness = wait_members_ready([updated_instance], probes=probes)[0]
+        ready_seconds = probes.clock() - wait_started
+        reason_codes = ", ".join(reason.code for reason in readiness.reasons)
+        if readiness.state not in SETTLED_STATES:
+            raise RuntimeError(f"readiness {readiness.state}: {reason_codes or 'no detail'}")
+        if readiness.state == "degraded":
+            typer.echo(f"WARNING: {instance.name} is degraded: {reason_codes}", err=True)
+        health_details = f"readiness={readiness.state} after {ready_seconds:.0f}s"
 
         runtime = verify_runtime(updated_instance, target)
         if not runtime.healthy:
@@ -610,17 +609,22 @@ def setup_quadlets(
     )
 
     _print_plan(changed_artifacts)
+    service = SystemdService()
+    probes = default_probes(service)
+    # Read-only: the unit state of unchanged members decides between start and none.
+    actions = plan_setup_actions(selected, changed_artifacts, probes.unit_status)
+    typer.echo("Member actions:")
+    for action in actions:
+        typer.echo(f" - {action.member}: {action.action} ({', '.join(action.reasons)})")
     typer.echo(
-        "  Apply: retire legacy services, prepare runtime config, reload systemd, "
-        "restart selected members."
+        "  Apply: retire legacy services, prepare runtime config, reload systemd, then one "
+        "member at a time: act, wait for ready/degraded within its start window; stop at "
+        "the first failure."
     )
 
     if not execute:
         typer.echo("DRY RUN setup-quadlets complete. Re-run with --execute to mutate state.")
         return
-
-    service = SystemdService()
-    failed = False
 
     _check_a2a_environment(selected, inventory)
 
@@ -649,17 +653,24 @@ def setup_quadlets(
         raise typer.Exit(code=1)
 
     if not changed_artifacts:
-        typer.echo("No rendered changes detected; ensuring selected services are running.")
+        typer.echo("No rendered changes detected; starting only inactive members.")
 
-    # Setup is an idempotent reconciliation operation: even when the rendered
-    # Quadlets already match, the selected service may be stopped or may never
-    # have been started. Restart every selected member after daemon-reload.
-    for instance in selected:
-        restart_result = service.restart(instance.name, execute=True)
-        _print_result(restart_result)
-        failed = failed or restart_result.return_code != 0
-
-    if failed:
+    # Restart only changed members; start unchanged inactive ones (#5 problem 1).
+    # Architecture-Ref: clawake/docs/architecture.md#lifecycle-contracts
+    # The doc still says setup restarts unchanged members; ADR-003 item 3 supersedes it.
+    outcomes = run_setup_actions(
+        selected, actions, service, probes, echo=typer.echo, on_result=_print_result
+    )
+    typer.echo("Setup summary:")
+    for line in setup_summary(outcomes):
+        typer.echo(line)
+    if any(outcome.result != "ok" for outcome in outcomes):
+        failed = next(outcome for outcome in outcomes if outcome.result == "failed")
+        typer.echo(
+            f"Setup stopped at {failed.member}: {', '.join(failed.reasons)}. "
+            "Later members were not touched.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
 
