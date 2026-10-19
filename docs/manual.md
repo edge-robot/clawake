@@ -39,8 +39,9 @@ uv run clawake dashboard -c personal-team/team.yml -m pflegebetreuer
 
 Vor `setup --execute` müssen die im Inventar referenzierten Teamdefinitionen und
 Environment-Dateien vorbereitet sein. Setup erzeugt Laufzeitverzeichnisse und
-verwaltete OpenClaw-Einstellungen, installiert Quadlets und startet die ausgewählten
-Dienste neu – auch bei unveränderten Quadlets. Onboarding öffnet den interaktiven
+verwaltete OpenClaw-Einstellungen und installiert Quadlets. Neu gestartet werden nur
+geänderte Mitglieder; unveränderte inaktive Mitglieder werden gestartet, unveränderte
+aktive bleiben unberührt (see "Targeted `setup` and readiness-gated `sync-plugins`"). Onboarding öffnet den interaktiven
 OpenClaw-Assistenten im Container. Dort werden insbesondere Modellzugang und
 Laufzeiteinstellungen eingerichtet. Rolleninformationen stammen aus
 `/team-definition`; eine Rollenbeschreibung ersetzt keine technische Berechtigung.
@@ -253,3 +254,82 @@ uv run clawake status -c personal-team/team.yml --wait --timeout 300 --format js
 - Exit code: 1 if any member is `stopped` or `failed`; with `--wait` also if any member
   is not `ready` or `degraded` at the end. `degraded` alone exits 0.
 - `status` is read-only. It never starts, restarts or installs anything.
+
+## Targeted `setup` and readiness-gated `sync-plugins`
+
+ADR-003 (decision items 3, 4 and 6). Both commands act on v1 members one at a time and
+stop at the first failure; later members are not touched. v2 inventories are unchanged.
+
+### `setup`
+
+The preview prints one action per selected member, with its reason:
+
+```text
+Member actions:
+ - example-lead: restart (example-lead.container)
+ - example-dev: none (unchanged, unit_active)
+ - example-ops: start (unchanged, unit_inactive)
+```
+
+- `restart`: a rendered artifact of the member changed (the file names are listed), or its
+  managed OpenClaw runtime config or runtime ledger would change (`runtime_config`).
+- `start`: nothing changed, but the unit is not active (`unit_inactive`, `unit_failed`,
+  `unit_not_found`, ...). The preview reads the unit state with `systemctl --user status`,
+  which is read-only.
+- `none`: nothing changed and the unit is active. The member is not restarted and not
+  waited on.
+
+With `--execute`, Clawake runs the usual preparation (legacy services, runtime
+directories, artifacts, `daemon-reload`). Then, per member in inventory order, it runs
+`systemctl --user restart|start` and waits until the member is `ready` or `degraded`,
+bounded by `readiness.start_window_seconds`. `degraded` is accepted with a `WARNING`
+line. A failed command or a `failed`/`stopped` readiness stops the run, and the command
+exits with code 1. A summary table follows:
+
+```text
+Setup summary:
+  member        action   result   readiness  ready_s  reasons
+  example-lead  restart  ok       ready      46       -
+  example-dev   none     ok       -          -        -
+  example-ops   start    not_run  -          -        -
+```
+
+### `sync-plugins`
+
+The preview probes each member once (read-only, as `status` does) and prints per plugin
+`version:` (the version inside the pinned archive, or the npm spec version) and an
+`action:` line:
+
+- `skip`: the archive digest recorded in the plugin ledger equals the pin, and
+  `openclaw plugins list --json` shows the plugin enabled, `loaded` and at the pinned
+  version. For npm pins, `openclaw plugins inspect <id> --runtime --json` must show the
+  pinned spec and integrity instead of a ledger entry.
+- `install (<reasons>)`: reasons are `ledger_missing`, `digest_changed`,
+  `version_mismatch`, `plugin_missing`, `plugin_disabled`, `plugin_not_loaded`,
+  `integrity_mismatch` or `inspect_unparseable`.
+- `install (unverified) (member_not_ready)`: the member is not ready, so the skip rule
+  cannot be checked yet. `--execute` decides after the readiness wait.
+
+The preview ends with `Members to restart: ...`; `(if install)` marks members whose
+restart depends on an unverified decision.
+
+With `--execute`, per member: wait for `ready`/`degraded` (a `stopped` member fails at once
+with "run setup --execute first"), install the plugins that are not skipped, record each
+installed archive digest, apply managed plugin config and grants, restart only if
+something was installed or the config changed, wait again, and verify that every pinned
+plugin is listed at its pinned version and `loaded`. The summary has one row per member
+and plugin (action, plugin, version, digest prefix, readiness, seconds to ready).
+
+The installed-archive ledger is the `installedPlugins` object in
+`<state>/clawake-managed-plugin-runtime.json`. On the first `sync-plugins --execute` after
+this change, every archive plugin is installed once (`ledger_missing`), even if the
+running version already matches, because the digest was never recorded. Later runs skip
+it.
+
+### `upgrade`
+
+After the restart, `upgrade --execute` waits for readiness for up to
+`readiness.start_window_seconds` (default 180 s) instead of `health.retries` ×
+`health.interval_seconds`. `degraded` completes with a warning. Any other final state
+takes the existing failure path: the upgraded service is stopped, and the backup paths
+are printed.

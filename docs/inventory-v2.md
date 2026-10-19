@@ -163,17 +163,20 @@ instances:
     health: {path: /readyz, timeout_seconds: 5}   # defaults
     readiness:
       channels: false              # default; opt-in channel lifecycle check
-      start_window_seconds: 180    # default; bound for status --wait (1..3600)
+      start_window_seconds: 180    # default; readiness wait bound (1..3600)
 ```
 
 - `health.path` now defaults to `/readyz`. OpenClaw keeps `/readyz` red while startup
   plugin sidecars, channels or hooks are still settling; `/healthz` is liveness only.
   `upgrade` waits on the same path, so it is stricter than with the old `/health`
-  default. `HealthSpec` is not rendered into v1 Quadlets.
+  default. `HealthSpec` is not rendered into v1 Quadlets; `health.retries` and
+  `health.interval_seconds` no longer bound the `upgrade` wait.
 - `readiness.channels: true` adds `podman exec <container> openclaw channels status --json`
   to the probe. It reads the gateway's recorded channel lifecycle only; Clawake never
   passes `--probe`.
-- `readiness.start_window_seconds` bounds `status --wait`; `--timeout <s>` overrides it.
+- `readiness.start_window_seconds` bounds every readiness wait: `status --wait` (where
+  `--timeout <s>` overrides it), the per-member wait of `setup --execute` and
+  `sync-plugins --execute`, and the post-restart wait of `upgrade --execute`.
 
 States, evaluated in this order:
 
@@ -182,8 +185,13 @@ States, evaluated in this order:
 | `stopped` | the unit is inactive, dead or not loaded |
 | `failed` | the unit failed (or waits for an automatic restart), its state is unknown, or `--wait` ran out before `ready`/`degraded` |
 | `starting` | the unit is active or activating and `GET <gateway>/readyz` is not 200, refused or timed out |
-| `degraded` | `/readyz` is 200, but a pinned plugin is missing from `openclaw plugins list --json`, not `enabled`, not `status: loaded`, or its `version` differs from the pinned package version (`package/package.json` in the archive, or the npm spec version); or, with `channels: true`, a channel account reports `running: false` or a `lifecycle` other than `running`; or any of these outputs could not be parsed |
+| `degraded` | `/readyz` is 200, but a pinned plugin is missing from `openclaw plugins list --json`, not `enabled`, not `status: loaded`, or its `version` differs from the pinned package version (`package/package.json` in the archive, or the npm spec version); or, with `channels: true`, a channel account is not up; or any of these outputs could not be parsed |
 | `ready` | none of the above |
+
+A channel account is up only if `running` is `true`, `connected` is not `false`, and
+`lifecycle` is `ready` or `running` (OpenClaw 2026.9.9 reports `ready` on a healthy
+member). Otherwise the reasons are `channel_not_running`, `channel_not_connected` or
+`channel_lifecycle` (also for a missing or unknown lifecycle value).
 
 Every non-`ready` state carries snake_case `reasons` with a short sanitized detail.
 Probes are read-only: one HTTP GET from the host to the published gateway port (no
