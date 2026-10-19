@@ -434,7 +434,7 @@ def write_overlay(
     return backup
 
 
-# --- high-level API (P3b uses set_plugin_pin) -------------------------------------------------
+# --- high-level API (rollout uses plan_plugin_pins and set_plugin_pins) ------------------
 
 
 @dataclass(frozen=True)
@@ -504,8 +504,11 @@ def read_pins(inventory_path: Path) -> PinsReport:
     )
 
 
-def _validated_update(layers, new_overlay: dict[str, Any]) -> dict[str, Any]:
-    """Validate a prospective overlay and the effective inventory it produces; no writes."""
+def _validated_candidate(layers, new_overlay: dict[str, Any]):
+    """Validate a prospective overlay; return it normalized plus the effective inventory.
+
+    Same path as ``load_inventory_layers``: overlay validation, merge, model validation.
+    """
     from clawake.config import Inventory
 
     assert layers.pins_path is not None
@@ -517,8 +520,12 @@ def _validated_update(layers, new_overlay: dict[str, Any]) -> dict[str, Any]:
         overlay_source=layers.pins_path,
     )
     merged["runtime_pins"] = str(layers.pins_path)
-    Inventory.model_validate(merged)
-    return normalized
+    return normalized, Inventory.model_validate(merged)
+
+
+def _validated_update(layers, new_overlay: dict[str, Any]) -> dict[str, Any]:
+    """Validate a prospective overlay and the effective inventory it produces; no writes."""
+    return _validated_candidate(layers, new_overlay)[0]
 
 
 def _require_overlay(layers) -> dict[str, Any]:
@@ -556,6 +563,48 @@ def set_image_pins(
     return backup
 
 
+@dataclass(frozen=True)
+class PluginPin:
+    """One archive plugin pin as stored in the overlay."""
+
+    artifact_path: str
+    sha256: str
+
+
+def plan_plugin_pins(layers, pins: Mapping[str, Mapping[str, PluginPin]]):
+    """Overlay with new archive plugin pins per member, plus the effective inventory.
+
+    Validated through the same path as ``load_inventory``; nothing is written. Returns
+    ``(normalized_overlay, inventory)``.
+    """
+    overlay = _require_overlay(layers)
+    for member, member_pins in pins.items():
+        entry = overlay["members"].setdefault(member, {})
+        plugins = entry.setdefault("plugins", {})
+        for plugin_id, pin in member_pins.items():
+            plugins[plugin_id] = {"artifact_path": pin.artifact_path, "sha256": pin.sha256}
+    return _validated_candidate(layers, overlay)
+
+
+def set_plugin_pins(
+    inventory_path: Path,
+    member: str,
+    pins: Mapping[str, PluginPin],
+    *,
+    now: Clock | None = None,
+) -> Path:
+    """Pin archive plugins of ``member`` in one overlay write; returns the backup path.
+
+    The prospective overlay and the resulting effective inventory are validated before the
+    write, so an invalid pin never reaches disk. The inventory file is never touched.
+    """
+    layers = _layers(Path(inventory_path))
+    normalized, _inventory = plan_plugin_pins(layers, {member: pins})
+    backup = write_overlay(layers.pins_path, normalized, now=now)
+    assert backup is not None
+    return backup
+
+
 def set_plugin_pin(
     inventory_path: Path,
     member: str,
@@ -565,19 +614,28 @@ def set_plugin_pin(
     *,
     now: Clock | None = None,
 ) -> Path:
-    """Pin an archive plugin of ``member`` in the overlay; returns the backup path.
+    """Pin one archive plugin of ``member`` in the overlay; returns the backup path."""
+    return set_plugin_pins(
+        inventory_path, member, {plugin_id: PluginPin(artifact_path, sha256)}, now=now
+    )
 
-    The prospective overlay and the resulting effective inventory are validated before the
-    write, so an invalid pin never reaches disk. The inventory file is never touched.
-    """
-    layers = _layers(Path(inventory_path))
-    overlay = _require_overlay(layers)
-    entry = overlay["members"].setdefault(member, {})
-    entry.setdefault("plugins", {})[plugin_id] = {"artifact_path": artifact_path, "sha256": sha256}
-    normalized = _validated_update(layers, overlay)
-    backup = write_overlay(layers.pins_path, normalized, now=now)
-    assert backup is not None
-    return backup
+
+def copy_overlay(path: Path, output_dir: Path, *, now: Clock | None = None) -> Path:
+    """Copy the current overlay into ``output_dir`` as a new 0600 file; never overwrites."""
+    clock = now or (lambda: datetime.now(UTC))
+    _refuse_symlink(output_dir, "backup directory")
+    previous = _read_previous(path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = clock().astimezone(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+    for attempt in range(100):
+        suffix = "" if attempt == 0 else f"-{attempt}"
+        candidate = output_dir / f"{path.stem}-{stamp}{suffix}{path.suffix}"
+        try:
+            _write_private_file(candidate, previous)
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimePinsError(f"cannot allocate a unique backup name in {output_dir}")
 
 
 # --- migration ------------------------------------------------------------------------------
