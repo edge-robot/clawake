@@ -1,7 +1,7 @@
 ---
 prompt: docs/prompts/2026-10-19-discord-channel.md
 branch: feat/26-discord-channel
-commits: 80db7de..6ee5f0d (plus the commit that adds this report and the prompt)
+commits: 80db7de..6ee5f0d (plus the commit that adds this report and the prompt); follow-up 28fab84 (plus the follow-up report commit)
 status: done
 e2e-request: required
 ---
@@ -292,3 +292,161 @@ Please also check the open ADR question: after a pairing approval and a gateway 
   documented in `docs/inventory-v2.md`.
 - `tests/test_cli.py:250`: `test_setup_quadlets_dry_run_succeeds` does not patch
   `cli.default_probes`, so it may probe 127.0.0.1. Pre-existing; not changed.
+
+## Follow-up 2026-10-19
+
+Prompt: `docs/prompts/2026-10-19-discord-channel-followup.md`, base `8a5808f`
+(ADR-005 amendment, items 7 and 8). Implementation commit `28fab84`.
+
+### Summary
+
+- `token_env` now matches the OpenClaw env SecretRef id pattern
+  `^[A-Z][A-Z0-9_]{0,127}$`. It uses its own constant `DISCORD_TOKEN_ENV_PATTERN` in
+  `src/clawake/config.py`, with a comment that references the schema. The shared
+  `ENV_NAME_PATTERN` and the A2A `inbound_token_env` / `outbound_token_env` fields are
+  unchanged.
+- `DiscordSpec.runtime_config()` always renders `"configWrites": false` for an enabled
+  member, after `groupPolicy` and before `guilds`. It cannot be set in the inventory:
+  `config_writes` / `configWrites` are unknown keys, and the model already forbids those
+  (`extra="forbid"`). A disabled member still renders only `{"enabled": false}`.
+- Docs: `docs/inventory-v2.md` (the `token_env` pattern, the unknown-key list, the
+  rendered key list and a `configWrites` rule) and `docs/manual.md` (the `token_env`
+  pattern, `configWrites: false`, and the one-time `configWrites (added)` preview line plus
+  restart for an already-owned member).
+- OpenClaw fact checked: https://docs.openclaw.ai/channels/discord/events, section
+  "Config writes": "Channel-initiated config writes are enabled by default". It covers
+  `/config set|unset` (when command features are enabled), and setting
+  `channels.discord.configWrites: false` disables them. The schema facts
+  (`additionalProperties: false`, the SecretRef id pattern) come from the architect's
+  reading of `openclaw config schema`. I did not verify them myself, because there is no
+  OpenClaw in the devcontainer.
+
+### Changed files (vs. 8a5808f)
+
+```
+ docs/inventory-v2.md                               | 13 +++++++----
+ docs/manual.md                                     |  7 ++++++
+ src/clawake/config.py                              |  9 +++++++-
+ .../golden/lead.channels-discord.json              |  1 +
+ tests/test_discord_channel.py                      | 27 +++++++++++++++++++++-
+```
+
+### Checks
+
+| Command | Result |
+|---|---|
+| `uv sync --locked` | pass |
+| `uv run ruff check .` | pass (`All checks passed!`) |
+| `uv run ruff format --check .` | pass (`51 files already formatted`) |
+| `uv run pytest -q` | pass (590 passed, 2 skipped) |
+| `uv lock --check` | pass |
+
+No new `# noqa` or `# type: ignore`.
+
+### New tests and tests that failed first
+
+All in `tests/test_discord_channel.py`. I ran them before the implementation:
+`5 failed, 74 passed`.
+
+| Test | Before fix |
+|---|---|
+| `test_discord_model_rejects[token_env_leading_underscore]` (`_DISCORD_BOT_TOKEN`) | failed |
+| `test_discord_model_rejects[token_env_129_chars]` (`"D" * 129`) | failed |
+| `test_enabled_render_always_disables_config_writes` (new) | failed (`KeyError: 'configWrites'`) |
+| `test_rendering_is_deterministic_and_uses_openclaw_names` (key order now includes `configWrites`) | failed |
+| `test_rendering_omits_empty_lists_and_unset_optionals` (expects `"configWrites": False`) | failed |
+| `test_discord_model_rejects[token_env_leading_digit]` (`1DISCORD`) | passed (the old pattern already rejected it); regression guard |
+| `test_discord_model_rejects[config_writes_snake]`, `[config_writes_camel]`, `[disabled_config_writes]` | passed (`extra="forbid"` already rejected them); regression guards |
+| `test_discord_model_accepts[token_env_128_chars]`, `[token_env_single_letter]` | passed; boundary guards |
+
+Changed expectations:
+- Golden `tests/fixtures/discord-channel/golden/lead.channels-discord.json`: adds
+  `"configWrites": false`. `engineer.channels-discord.json` is unchanged
+  (`{"enabled": false}`).
+- `test_adoption_preview_redacts_ids_and_mutates_nothing`: the adoption preview now also
+  lists `channels/discord/configWrites (added)`. The section "Setup preview for the
+  synthetic adoption" above shows the state before this follow-up.
+
+### Mutation check
+
+I ran this in a scratch copy, with `PYTHONPATH` pointing at the mutated `src`. Dropping
+the line `config["configWrites"] = False` made 5 tests fail:
+`test_rendered_discord_objects_match_golden`,
+`test_rendering_is_deterministic_and_uses_openclaw_names`,
+`test_rendering_omits_empty_lists_and_unset_optionals`,
+`test_enabled_render_always_disables_config_writes` and
+`test_adoption_preview_redacts_ids_and_mutates_nothing`.
+
+### Updated golden render of the synthetic Lead
+
+`tests/fixtures/discord-channel/golden/lead.channels-discord.json`:
+
+```json
+{
+  "enabled": true,
+  "token": {
+    "source": "env",
+    "provider": "default",
+    "id": "DISCORD_BOT_TOKEN"
+  },
+  "applicationId": "100000000000000010",
+  "dmPolicy": "allowlist",
+  "allowFrom": [
+    "100000000000000003",
+    "100000000000000004"
+  ],
+  "groupPolicy": "allowlist",
+  "configWrites": false,
+  "guilds": {
+    "100000000000000001": {
+      "requireMention": true,
+      "roles": [
+        "100000000000000005"
+      ],
+      "channels": {
+        "100000000000000002": {
+          "enabled": true,
+          "requireMention": true,
+          "users": [
+            "100000000000000003",
+            "100000000000000004"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+### Acceptance criteria
+
+- New tests failed first; mutation check finds a dropped `configWrites`: **met** (see
+  above).
+- All five mandatory checks green: **met**.
+
+### Behaviour changes for operators
+
+- `validate` / `setup` reject a `token_env` with a leading underscore or more than 128
+  characters. The error names the `token_env` field.
+- The rendered `channels.discord` of an enabled member gains `configWrites: false`. A
+  member whose `channels/discord` is already owned shows
+  `channels/discord/configWrites (added)` in its next `setup` preview and is restarted
+  once.
+
+### Live E2E request (addition)
+
+`e2e-request: required` still applies, because the rendered OpenClaw config changed. Run
+the P4 E2E request above, plus:
+- In the adoption preview
+  (`clawake setup -c deploy/team.yml --adopt discord-channel`), expect
+  `channels/discord/configWrites (added)` for each enabled member.
+- After `--execute`, OpenClaw accepts the config. Check that the gateway starts without a
+  config schema error (I did not verify that a dedicated validate subcommand exists), and that
+  `status --wait` reports `ready`.
+- Optional: in the allowed lead channel, `/config set` from Discord is refused.
+
+### Open points and risks
+
+- The schema facts are unverified in the devcontainer (no OpenClaw). The live E2E above
+  is the verification.
+- A member that is already owned restarts once to pick up `configWrites: false`.
