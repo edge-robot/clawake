@@ -200,6 +200,65 @@ of at most 10 s. Raw command output, container environment and tokens are never 
 OpenClaw's `plugins list --json` has no integrity field, so `degraded` compares versions,
 not sha256 digests.
 
+## Runtime pin overlay (`runtime_pins`, v1)
+
+ADR-004. A v1 inventory may move its per-rollout values into a private, Clawake-owned
+JSON file. The versioned inventory then stays unchanged across rollouts.
+
+```yaml
+version: 1
+runtime_pins: ${HOME}/.config/clawake/example-cad/pins.json   # or relative to this file
+instances:
+  - name: example-lead
+    image:
+      repository: ghcr.io/example/openclaw   # tag/digest/known_good_* come from the overlay
+    plugins:
+      - id: example-cad                       # artifact_path/sha256 come from the overlay
+        config: {liveReads: false}
+```
+
+```json
+{
+  "version": 1,
+  "cluster": "example-cad",
+  "members": {
+    "example-lead": {
+      "image": {"tag": "2026.1.1", "digest": "sha256:<64 hex>",
+                "known_good_tag": "2026.1.0", "known_good_digest": "sha256:<64 hex>"},
+      "plugins": {"example-cad": {"artifact_path": "/srv/example/packages/example-cad-0.0.1.tgz",
+                                  "sha256": "sha256:<64 hex>"}}
+    }
+  }
+}
+```
+
+- **Reference.** `runtime_pins` is a path. `${...}` is expanded like other inventory
+  values; a relative path is resolved against the inventory file's directory. The file
+  must exist; only `clawake pins init` accepts a missing file. v2 inventories reject
+  `runtime_pins`.
+- **Allowlist.** `version` (must be `1`) and `cluster` (must equal `cluster.name`) are
+  required. Per declared member, only `image.tag`, `image.digest`,
+  `image.known_good_tag`, `image.known_good_digest` and, for declared archive plugins,
+  `plugins.<id>.artifact_path` and `plugins.<id>.sha256` are allowed. Unknown keys,
+  unknown members, undeclared plugin ids, pins for npm plugins and digests that are not
+  `sha256:<64 lowercase hex>` are rejected with the file path and the key path, for
+  example `members.example-lead.image.repository: unknown key`. Overlay values are not
+  `${...}`-expanded.
+- **Merge.** The overlay is applied to the expanded inventory data before model
+  validation, so all v1 validators see the effective values. A plugin entry may omit
+  `artifact_path`/`sha256` when the overlay supplies them. A field set in both files to
+  the same value is accepted; different values fail with
+  `runtime pins conflict: instances[<member>].image.digest is '<a>' in inventory <file>
+  but '<b>' in runtime pins <file>; remove it from one of them`.
+- **File safety.** Loading refuses a group- or world-writable overlay and warns if it is
+  group- or world-readable. Clawake writes it atomically (temporary file in the same
+  directory, `fsync`, rename, mode 0600), never through a symlink, and first copies the
+  previous version to `<overlay dir>/pins-backups/<UTC timestamp>.json` (mode 0600,
+  newest 20 kept).
+- **Writers.** With `runtime_pins`, `upgrade` and rollback write the image fields to the
+  overlay and never touch the inventory file. Without it, they edit the inventory as
+  before.
+
 ## MCP server models and the conflict rule
 
 Two inventory models provision OpenClaw's native MCP client configuration

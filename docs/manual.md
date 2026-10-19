@@ -333,3 +333,46 @@ After the restart, `upgrade --execute` waits for readiness for up to
 `health.interval_seconds`. `degraded` completes with a warning. Any other final state
 takes the existing failure path: the upgraded service is stopped, and the backup paths
 are printed.
+
+## Runtime pins (ADR-004)
+
+With `runtime_pins`, image tag/digest pins and archive plugin pins live in a private
+overlay file instead of the versioned inventory. The format and rules are in
+`docs/inventory-v2.md`, section "Runtime pin overlay".
+
+- `clawake validate -c <inventory>` prints
+  `runtime pins: <path> (N members, M fields)` when an overlay is in use.
+- `clawake pins show -c <inventory> [--format json]` is read-only. It prints every
+  effective pin per member and its source: `[inventory]`, `[overlay]`, or
+  `[overlay, also in inventory]` for an equal value present in both files (JSON:
+  `"source"` and `"also_in_inventory"`).
+- `upgrade --execute` with an overlay prints `pins: <path> (inventory file is not
+  modified)` in the preview, writes the new image fields to the overlay and prints the
+  backup of the previous overlay (`Updated runtime pins; previous pins: ...`; on failure
+  `Runtime pins recovery file: ...`). The preview already fails if the inventory still
+  contains an image field the upgrade would change (conflict).
+
+### Migration walkthrough (synthetic paths)
+
+1. Create a private directory outside any git checkout:
+   `install -d -m 0700 ~/.config/clawake/example-cad`.
+2. Preview the overlay:
+   `clawake pins init -c deploy/team.yml --output ~/.config/clawake/example-cad/pins.json`.
+   The preview prints the exact JSON, the inventory fields to remove
+   (`instances[<member>].image.tag`, ..., `instances[<member>].plugins[<id>].sha256`) and
+   the top-level `runtime_pins` line to add. It refuses an existing output file.
+3. Write it: the same command with `--execute`. It creates the file with mode 0600 and
+   never edits the inventory.
+4. Add the `runtime_pins` line to the inventory. Until the listed fields are removed,
+   both files carry equal values, which is allowed.
+5. Remove the listed fields from the inventory.
+6. Prove equivalence with read-only commands:
+   - `clawake validate -c deploy/team.yml` (shows the `runtime pins:` line);
+   - `clawake pins show -c deploy/team.yml` (every pin `[overlay]`);
+   - `clawake setup -c deploy/team.yml` (preview: `0/N member(s) changed`, every member
+     action `none`);
+   - `clawake sync-plugins -c deploy/team.yml` (preview: `action: skip` for every plugin
+     that was skipped before the migration).
+
+To roll back the overlay, copy a file from `pins-backups/` over `pins.json`
+(`install -m 0600 <backup> pins.json`) and re-run the previews.
