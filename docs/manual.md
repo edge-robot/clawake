@@ -473,3 +473,108 @@ too.
 
 Differences from `setup`: `rollout` does not retire legacy services and does not check
 A2A environment files (it never reads secrets). Run `setup` for those.
+
+## Discord channel from the inventory (ADR-005)
+
+Clawake renders `channels.discord` of each v1 member that declares `openclaw.discord`. It
+owns the whole object as the ledger field `channels/discord`. Private IDs come from the
+operator-written `site_values` file through `${site:<name>}` references. The bot token is
+only ever an env SecretRef. Format and rules are in `docs/inventory-v2.md`, sections
+"Site values" and "Discord channel".
+
+- `setup` (preview and `--execute`) exits with code 2 if `token_env` is not a key in any
+  of the member's `env_files`. Only key names are parsed; values are never read into
+  output, errors or the ledger.
+- The preview prints changed key paths below `channels/discord` with IDs as `<id>` and
+  `(added)`, `(removed)` or `(changed)` markers. It never prints values.
+- After Clawake owns the object, a change made through `openclaw config patch`, the UI or
+  an agent blocks the next `setup` with
+  `Managed field changed outside Clawake: channels/discord`. Move the change into the
+  inventory or the site values file, or revert it. Pairing approvals live in the OpenClaw
+  state database and do not trip the guard.
+- `rollout` has no `--adopt`. While an adoption is pending, it fails with the same
+  `Refusing to overwrite unmanaged OpenClaw field: channels/discord ...` error as `setup`.
+
+### Acceptance check
+
+There is no Discord-specific probe. Set `readiness.channels: true` on every member with
+`discord.enabled: true` and run `clawake status -c <inventory> --wait`. The member must
+reach `ready`; a Discord account that is not up makes it `degraded` with a
+`channel_not_running`, `channel_not_connected` or `channel_lifecycle` reason. Whether a
+disabled Discord account counts as "not up" is not verified, so leave
+`readiness.channels` unset on disabled members.
+
+### Migration walkthrough for a hand-written block (synthetic values)
+
+The example team has two members: `example-lead` with Discord enabled and
+`example-engineer` with Discord disabled. Both carry a hand-written `channels.discord`
+with a plaintext string `token`.
+
+1. **Token to the env file and SecretRef.** Clawake never reads, moves or deletes a token
+   value; the operator does this by hand on each member.
+   - `example-lead`: add `DISCORD_BOT_TOKEN=<bot token>` to the member env file listed in
+     `env_files`. In the member's `openclaw.json`, replace `channels.discord.token` with
+     `{"source": "env", "provider": "default", "id": "DISCORD_BOT_TOKEN"}`.
+   - `example-engineer`: Discord is disabled. Remove `channels.discord.token` from its
+     `openclaw.json`. Optionally replace it with a SecretRef instead.
+2. **Write the site values file** outside any git checkout:
+   `install -d -m 0700 ~/.config/clawake/example-cad`, then create
+   `~/.config/clawake/example-cad/site.json` with mode 0600:
+
+   ```json
+   {
+     "version": 1,
+     "cluster": "example-cad",
+     "values": {
+       "discord.guild": "100000000000000001",
+       "discord.lead_channel": "100000000000000002",
+       "discord.approvers": ["100000000000000003", "100000000000000004"]
+     }
+   }
+   ```
+
+3. **Add the blocks to the inventory**, with `site_values:
+   ${HOME}/.config/clawake/example-cad/site.json` at the top level:
+
+   ```yaml
+   # example-lead
+   openclaw:
+     discord:
+       enabled: true
+       token_env: DISCORD_BOT_TOKEN
+       group_policy: allowlist
+       guilds:
+         - id: ${site:discord.guild}
+           channels:
+             - id: ${site:discord.lead_channel}
+               users: ${site:discord.approvers}
+   readiness: {channels: true}
+   # example-engineer
+   openclaw:
+     discord: {enabled: false}
+   ```
+
+4. **Read-only checks:**
+   - `clawake validate -c deploy/team.yml` prints
+     `site values: <path> (3 values, 3 references)` and no `unused values` warning.
+   - `clawake setup -c deploy/team.yml` (no flag) stops with
+     `Refusing to overwrite unmanaged OpenClaw field: channels/discord (named adoption
+     'discord-channel': review the preview, then run setup with --adopt discord-channel)`.
+     This confirms that both blocks are still unowned.
+   - `clawake setup -c deploy/team.yml --adopt discord-channel` previews the adoption. If
+     a token is still a string, it stops with `Cannot adopt channels/discord of member
+     <member>: the live token in <path> is a plaintext string. ...`; repeat step 1.
+     Otherwise it lists the changed `channels/discord/...` key paths (IDs as `<id>`) and
+     ` - <member>: adopt discord-channel (backup first: .backups/<member>-<UTC
+     timestamp>.tar.gz)` for each member.
+5. **Execute:** `clawake setup -c deploy/team.yml --adopt discord-channel --execute`.
+   For each adopting member, a `backup_instance` archive is written to `.backups/` before
+   any file changes. A failed backup stops the run before anything is written. Then setup
+   replaces the objects, records ownership and restarts the changed members one at a time.
+6. **Accept:** `clawake status -c deploy/team.yml -m example-lead --wait` must report
+   `ready` (see "Acceptance check").
+7. **Idempotence:** the same `setup ... --adopt discord-channel` preview now shows
+   `0/2 member(s) changed` and no `Adoptions:` block. From now on, run plain `setup`.
+
+To roll back, restore the member's `openclaw.json` and `clawake-managed-runtime.json`
+from the archive in `.backups/`.

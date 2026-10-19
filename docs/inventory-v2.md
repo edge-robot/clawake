@@ -259,6 +259,122 @@ instances:
   overlay and never touch the inventory file. Without it, they edit the inventory as
   before.
 
+## Site values and `${site:<name>}` references (`site_values`, v1)
+
+ADR-005 items 1 and 2. Private site data that is not secret, for example Discord IDs, lives
+in an operator-written JSON file. The versioned inventory refers to it by name only.
+
+```yaml
+version: 1
+site_values: ${HOME}/.config/clawake/example-cad/site.json   # or relative to this file
+```
+
+```json
+{
+  "version": 1,
+  "cluster": "example-cad",
+  "values": {
+    "discord.guild": "100000000000000001",
+    "discord.lead_channel": "100000000000000002",
+    "discord.approvers": ["100000000000000003", "100000000000000004"]
+  }
+}
+```
+
+- **File.**
+  - `version` must be `1` and `cluster` must equal `cluster.name`.
+  - `values` maps names (`^[a-z0-9][a-z0-9_.-]*$`) to a string or a list of strings.
+  - Other top-level keys, other value types and invalid names are rejected. The error
+    names the file and the key path, never a value.
+  - The path is resolved like `runtime_pins`: `${...}` is expanded, and a relative path
+    is resolved against the inventory directory. A declared file that is missing is an
+    error.
+  - File safety follows the overlay rules: a group- or world-writable file is refused,
+    and a group- or world-readable one prints a warning.
+  - **Clawake never writes this file.** There is no `init` command. It never holds
+    secrets: tokens stay in member env files.
+  - v2 inventories reject `site_values`.
+- **References.** An inventory string that is exactly `${site:<name>}` is replaced by the
+  value.
+  - Order: `${VAR}` expansion first (it never looks up `site:…`), then site
+    substitution, then the runtime pin overlay, then model validation.
+  - A list value replaces the whole field, for example `users: ${site:discord.approvers}`.
+    A list in a string-only position is a model type error.
+  - Any other string that contains `${site:` is an error, so IDs are never concatenated.
+    Mapping keys cannot be references.
+  - An unknown name fails loading. A reference without a declared `site_values` also fails.
+  - Errors name the inventory path and the site value name, for example
+    `instances[example-lead].openclaw.discord.guilds[0].id: unknown site value
+    'discord.gild' (not defined in site values file <path>)`.
+  - Substitution is generic: plugin `config` may use the same references.
+- **`validate`** prints `site values: <path> (N values, M references)`. For values that
+  no reference uses it prints
+  `WARNING: site values file <path>: unused values: <name>, ...` (names only).
+
+## Discord channel (`openclaw.discord`, v1 members)
+
+ADR-005 items 3 and 4. Clawake renders the whole default-account `channels.discord`
+object of a member and owns it as one ledger field, `channels/discord`.
+
+```yaml
+openclaw:
+  discord:
+    enabled: true
+    token_env: DISCORD_BOT_TOKEN                      # env key name, never a value
+    application_id: ${site:discord.application_id}    # optional
+    dm_policy: allowlist                              # disabled (default) | allowlist | pairing
+    allow_from: ${site:discord.dm_allow}              # required iff dm_policy: allowlist
+    group_policy: allowlist                           # allowlist | disabled
+    guilds:
+      - id: ${site:discord.guild}
+        require_mention: true
+        roles: ["${site:discord.operator_role}"]      # quote references inside [ ]
+        channels:
+          - id: ${site:discord.lead_channel}
+            require_mention: true
+            users: ${site:discord.approvers}
+```
+
+| Key | Type | Default | Rule |
+|---|---|---|---|
+| `enabled` | bool | `true` | `false` renders `{"enabled": false}`; no other key is allowed |
+| `token_env` | env name `^[A-Z_][A-Z0-9_]*$` | none | required when enabled; `setup` checks that it is a key in one of the member's `env_files` |
+| `application_id` | snowflake | unset | optional |
+| `dm_policy` | `disabled` \| `allowlist` \| `pairing` | `disabled` | `open` is not offered |
+| `allow_from` | list of snowflakes | `[]` | required and non-empty with `dm_policy: allowlist`, forbidden otherwise |
+| `group_policy` | `allowlist` \| `disabled` | `allowlist` | `open` is not offered |
+| `guilds[].id` | snowflake | none | unique across `guilds` |
+| `guilds[].require_mention` | bool | `true` | |
+| `guilds[].users`, `guilds[].roles` | list of snowflakes | `[]` | guild defaults; no duplicates |
+| `guilds[].channels[].id` | snowflake | none | unique across all guilds |
+| `guilds[].channels[].enabled` | bool | `true` | |
+| `guilds[].channels[].require_mention` | bool | unset | rendered only when set |
+| `guilds[].channels[].users`, `.roles` | list of snowflakes | `[]` | no duplicates |
+
+- **Snowflakes.** After substitution, every ID must match `^[0-9]{17,20}$` and be a YAML
+  string: quote literal IDs, and quote references inside flow lists (`["${site:x}"]`). Names, tags, `*` and `dangerouslyAllowNameMatching` are rejected, and so are
+  unknown keys such as `token` or `accounts`.
+- **Allowlist rule (#21).** With `group_policy: allowlist`:
+  - every enabled channel needs non-empty `users` or `roles`, either its own or its
+    guild's;
+  - a guild without `channels` needs guild `users` or `roles`, because OpenClaw then
+    allows every channel of that guild.
+- **Rendering.**
+  - OpenClaw key names: `enabled`, `token`, `applicationId`, `dmPolicy`, `allowFrom`,
+    `groupPolicy`, and `guilds.<id>` with `requireMention`, `users`, `roles` and
+    `channels.<id>.{enabled,requireMention,users,roles}`.
+  - `token` is always `{"source": "env", "provider": "default", "id": <token_env>}`.
+  - Empty lists and unset optionals are omitted.
+- **Ownership.**
+  - A member without `discord` leaves `channels.discord` untouched and unowned.
+  - An existing unowned block that differs from the rendering is taken over only with
+    `setup --adopt discord-channel` (see the manual).
+  - After that, any change made outside Clawake trips the drift guard
+    (`Managed field changed outside Clawake: channels/discord`).
+- **Preview redaction.** Changed key paths below `channels/discord` are printed with every
+  ID segment as `<id>` and an `(added)`, `(removed)` or `(changed)` marker. Values are
+  never printed.
+
 ## MCP server models and the conflict rule
 
 Two inventory models provision OpenClaw's native MCP client configuration
