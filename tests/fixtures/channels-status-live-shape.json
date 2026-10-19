@@ -1,0 +1,30 @@
+{
+  "channelAccounts": {
+    "discord": [
+      {
+        "accountId": "default",
+        "configured": true,
+        "enabled": true,
+        "lifecycle": "ready",
+        "running": true,
+        "connected": true,
+        "restartPending": false,
+        "reconnectAttempts": 0,
+        "lastError": null
+      }
+    ],
+    "a2a": [
+      {
+        "accountId": "default",
+        "configured": true,
+        "enabled": true,
+        "lifecycle": "ready",
+        "running": true,
+        "connected": true,
+        "restartPending": false,
+        "reconnectAttempts": 0,
+        "lastError": null
+      }
+    ]
+  }
+}

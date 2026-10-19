@@ -39,8 +39,9 @@ SETTLED_STATES: frozenset[str] = frozenset({"ready", "degraded"})
 PROBE_TIMEOUT_SECONDS = 10.0
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 _PACKAGE_JSON_LIMIT_BYTES = 1024 * 1024
-# OpenClaw documents "blocked" as a non-running lifecycle; only "running" is accepted as up.
-_RUNNING_LIFECYCLES = frozenset({"running"})
+# OpenClaw documents "blocked" as a non-running lifecycle. A healthy 2026.9.9 member reports
+# "ready" (live sample, docs/evidence/2026-10-19-member-readiness-status.md); "running" is kept.
+_UP_LIFECYCLES = frozenset({"ready", "running"})
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,47}")
 _ACTIVE_LINE = re.compile(r"^\s*Active:\s*(?P<state>[a-z-]+)(?:\s+\((?P<sub>[^)]*)\))?", re.M)
 
@@ -191,6 +192,11 @@ def _pinned_or_none(plugin: PluginSpec) -> str | None:
         return pinned_plugin_version(plugin)
     except ValueError:
         return None
+
+
+def classify_unit(result: CommandResult) -> tuple[ReadinessState | None, Reason | None]:
+    """Public view of the unit mapping: None means the unit is active (or reloading)."""
+    return _unit_state(result)
 
 
 def _unit_state(result: CommandResult) -> tuple[ReadinessState | None, Reason | None]:
@@ -353,9 +359,15 @@ def evaluate_channels(result: CommandResult) -> list[Reason]:
         if not isinstance(running, bool) and not isinstance(lifecycle, str):
             reasons.append(Reason("channels_unparseable", f"{label}: no running or lifecycle"))
             continue
-        if running is False:
-            reasons.append(Reason("channel_not_running", f"{label}: running=false"))
-        if isinstance(lifecycle, str) and lifecycle not in _RUNNING_LIFECYCLES:
+        # Up means: running is true, connected is not false, lifecycle is ready/running.
+        if running is not True:
+            state = "false" if running is False else "missing"
+            reasons.append(Reason("channel_not_running", f"{label}: running={state}"))
+        if account.get("connected") is False:
+            reasons.append(Reason("channel_not_connected", f"{label}: connected=false"))
+        if not isinstance(lifecycle, str):
+            reasons.append(Reason("channel_lifecycle", f"{label}: lifecycle missing"))
+        elif lifecycle not in _UP_LIFECYCLES:
             reasons.append(Reason("channel_lifecycle", f"{label}: lifecycle {_safe(lifecycle)}"))
     return reasons
 

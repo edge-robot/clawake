@@ -397,6 +397,51 @@ def test_degraded_when_channel_is_not_running(
     assert code in _codes(result)
 
 
+LIVE_CHANNELS = Path(__file__).parent / "fixtures" / "channels-status-live-shape.json"
+
+
+def _live_channels(**overrides: object) -> str:
+    """The recorded 2026.9.9 shape (synthetic IDs) with one discord account overridden."""
+    payload = json.loads(LIVE_CHANNELS.read_text(encoding="utf-8"))
+    payload["channelAccounts"]["discord"][0].update(overrides)
+    return json.dumps(payload)
+
+
+def test_channel_live_shape_with_lifecycle_ready_is_up(tmp_path: Path) -> None:
+    probes = FakeProbes(channels=_ok(_live_channels()))
+    result = probe_member(_instance(tmp_path, readiness={"channels": True}), probes.bundle())
+    assert result.state == "ready"
+    assert result.reasons == ()
+
+
+def test_channel_live_shape_connected_false_is_degraded(tmp_path: Path) -> None:
+    probes = FakeProbes(channels=_ok(_live_channels(connected=False)))
+    result = probe_member(_instance(tmp_path, readiness={"channels": True}), probes.bundle())
+    assert result.state == "degraded"
+    assert _codes(result) == ["channel_not_connected"]
+
+
+@pytest.mark.parametrize("lifecycle", ["warming", "Ready", ""])
+def test_channel_live_shape_unknown_lifecycle_is_degraded(tmp_path: Path, lifecycle: str) -> None:
+    probes = FakeProbes(channels=_ok(_live_channels(lifecycle=lifecycle)))
+    result = probe_member(_instance(tmp_path, readiness={"channels": True}), probes.bundle())
+    assert result.state == "degraded"
+    assert _codes(result) == ["channel_lifecycle"]
+
+
+def test_channel_running_without_lifecycle_is_degraded(tmp_path: Path) -> None:
+    stdout = _channels_json({"accountId": "default", "running": True})
+    probes = FakeProbes(channels=_ok(stdout))
+    result = probe_member(_instance(tmp_path, readiness={"channels": True}), probes.bundle())
+    assert _codes(result) == ["channel_lifecycle"]
+
+
+def test_channel_ready_lifecycle_but_not_running_is_degraded(tmp_path: Path) -> None:
+    probes = FakeProbes(channels=_ok(_live_channels(running=False)))
+    result = probe_member(_instance(tmp_path, readiness={"channels": True}), probes.bundle())
+    assert _codes(result) == ["channel_not_running"]
+
+
 def test_channel_lifecycle_blocked_reports_both_running_and_lifecycle(tmp_path: Path) -> None:
     stdout = _channels_json({"accountId": "default", "running": False, "lifecycle": "blocked"})
     probes = FakeProbes(channels=_ok(stdout))
