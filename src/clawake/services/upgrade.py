@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+from clawake.services import runtime_pins
+
 
 @dataclass
 class UpgradePlan:
@@ -16,6 +18,8 @@ class UpgradePlan:
     previous_digest: str | None
     next_tag: str
     next_digest: str | None
+    # ADR-004: backup of the previous runtime pin overlay when the overlay was written.
+    pins_backup: Path | None = None
 
 
 def _load_config(config_path: Path) -> dict:
@@ -131,6 +135,19 @@ def _plan_from_image(
     )
 
 
+def _declares_runtime_pins(config: object) -> bool:
+    return isinstance(config, dict) and config.get("runtime_pins") is not None
+
+
+def _effective_image(config_path: Path, instance_name: str) -> dict:
+    """Image mapping of one member after the runtime pin overlay was applied (ADR-004)."""
+    # Lazy import: config imports services.runtime_pins, which this module also uses.
+    from clawake.config import load_inventory_layers
+
+    layers = load_inventory_layers(config_path)
+    return dict(_find_instance(layers.merged, instance_name)["image"])
+
+
 def build_upgrade_plan(
     config_path: Path,
     instance_name: str,
@@ -138,8 +155,42 @@ def build_upgrade_plan(
     next_digest: str | None,
 ) -> UpgradePlan:
     config = _load_config(config_path)
+    if _declares_runtime_pins(config):
+        image = _effective_image(config_path, instance_name)
+        return _plan_from_image(instance_name, image, next_tag, next_digest)
     instance = _find_instance(config, instance_name)
     return _plan_from_image(instance_name, instance["image"], next_tag, next_digest)
+
+
+def plan_overlay_upgrade(
+    config_path: Path,
+    instance_name: str,
+    next_tag: str | None,
+    next_digest: str | None,
+) -> Path | None:
+    """Validate the overlay write of an upgrade without writing; returns the overlay path.
+
+    Returns ``None`` when the inventory does not declare ``runtime_pins``.
+    """
+    if not _declares_runtime_pins(_load_config(config_path)):
+        return None
+    image = _effective_image(config_path, instance_name)
+    plan = _plan_from_image(instance_name, image, next_tag, next_digest)
+    layers, _overlay = runtime_pins.plan_image_pins(
+        config_path, instance_name, _upgrade_updates(plan, image)
+    )
+    return layers.pins_path
+
+
+def _upgrade_updates(plan: UpgradePlan, image: dict) -> dict[str, str | None]:
+    updates = {
+        "tag": plan.next_tag,
+        "digest": plan.next_digest,
+        "known_good_tag": image["tag"],
+    }
+    if image.get("digest"):
+        updates["known_good_digest"] = image["digest"]
+    return updates
 
 
 def apply_upgrade(
@@ -149,6 +200,14 @@ def apply_upgrade(
     next_digest: str | None,
 ) -> UpgradePlan:
     config = _load_config(config_path)
+    if _declares_runtime_pins(config):
+        # ADR-004: write the overlay, never the inventory file.
+        image = _effective_image(config_path, instance_name)
+        plan = _plan_from_image(instance_name, image, next_tag, next_digest)
+        plan.pins_backup = runtime_pins.set_image_pins(
+            config_path, instance_name, _upgrade_updates(plan, image)
+        )
+        return plan
     instance = _find_instance(config, instance_name)
     image = instance["image"]
 
@@ -168,8 +227,12 @@ def apply_upgrade(
 
 def rollback_to_known_good(config_path: Path, instance_name: str) -> UpgradePlan:
     config = _load_config(config_path)
-    instance = _find_instance(config, instance_name)
-    image = instance["image"]
+    overlay = _declares_runtime_pins(config)
+    if overlay:
+        image = _effective_image(config_path, instance_name)
+    else:
+        instance = _find_instance(config, instance_name)
+        image = instance["image"]
     known_good = image.get("known_good_digest")
     if not known_good:
         raise ValueError(f"Instance '{instance_name}' does not define image.known_good_digest")
@@ -180,6 +243,12 @@ def rollback_to_known_good(config_path: Path, instance_name: str) -> UpgradePlan
 
     plan = _plan_from_image(instance_name, image, known_good_tag, known_good)
 
+    if overlay:
+        # ADR-004: write the overlay, never the inventory file.
+        plan.pins_backup = runtime_pins.set_image_pins(
+            config_path, instance_name, {"tag": known_good_tag, "digest": known_good}
+        )
+        return plan
     _update_image_fields(
         config_path,
         instance_name,
