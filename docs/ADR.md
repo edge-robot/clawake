@@ -164,3 +164,68 @@ Readiness signals, verified on 2026-10-16 against OpenClaw 2026.9.9 with read-on
   must not need hand edits of the versioned inventory.
 - Backup scope for `rollout`: inventory plus per-member managed config only, or also
   workspaces (reuse `services/backup.py`)?
+
+## ADR-004: Runtime pins live in a private overlay referenced by the inventory
+
+Status: Accepted (2026-10-19, user decision: option A, image digests included).
+Tracks edge-robot/clawake#20 (M11) and is a prerequisite for #24 (`clawake rollout`).
+
+### Context
+
+The versioned inventory of the deployed Onshape team is changed on every rollout:
+
+- the plugin `artifact_path` and `sha256` per member are edited by hand;
+- `upgrade` / rollback rewrite the image `tag`, `digest`, `known_good_tag` and
+  `known_good_digest` (`services/upgrade.py` `apply_upgrade`, `rollback_to_known_good`);
+- ClawOnshape's provisioning script writes the Candidate workspace ID. That part leaves
+  with edge-robot/clawonshape#11 P4 and is not Clawake's concern.
+
+As a result, the file is permanently dirty in a working tree that other actors share,
+and `rollout` would need a hand edit of a versioned file.
+
+Options considered:
+
+- **(A)** a private pin overlay referenced by the inventory;
+- **(B)** `${VAR}` expansion from env files;
+- **(C)** `rollout` rewriting the inventory.
+
+### Decision
+
+1. **Reference from the inventory.** A v1 inventory may declare
+   `runtime_pins: <path>`, either relative to the inventory file or expanded like other
+   paths. The file is Clawake-owned private state: not versioned, mode 0600.
+2. **Allowlisted fields only.** The overlay may set, per declared member:
+   - `image.tag`, `image.digest`, `image.known_good_tag`, `image.known_good_digest`;
+   - for declared archive plugins, `plugins.<id>.artifact_path` and
+     `plugins.<id>.sha256`.
+
+   Anything else is rejected, including unknown members, undeclared plugin ids, npm
+   plugins and other keys.
+3. **Merge before validation, conflicts fail closed.** The overlay is applied to the raw
+   inventory before model validation.
+   - If both files set a field to **different** values, loading fails.
+   - Equal values are allowed, so the migration can proceed step by step.
+4. **Writers.** With `runtime_pins` declared:
+   - `upgrade` / rollback write image fields to the overlay instead of the inventory;
+   - `rollout` (P3b) writes plugin pins only after a verified rollout.
+
+   Writes are atomic (temporary file + rename, mode 0600) and keep timestamped backups of
+   the previous overlay, which are the rollback target. Without `runtime_pins`,
+   behaviour is unchanged.
+5. **Migration.**
+   - A preview-first command extracts the current pins from an inventory into a new
+     overlay.
+   - The operator then removes the pinned fields from the versioned inventory and adds
+     `runtime_pins`.
+   - For the deployed team, the operator session does this, because it owns
+     `clawonshape/deploy/team.json`.
+6. **v2 inventories are unchanged.** v2 rejects `runtime_pins` until v2 rollout exists.
+
+### Consequences
+
+- The versioned inventory stays reviewable and clean. The effective deployment is
+  inventory plus overlay, and `clawake pins show` must make the source of each value
+  visible.
+- The overlay is a single point of truth for "what is deployed". Its backups replace hand
+  backups of `team.json`.
+- The Candidate ID remains in the inventory until clawonshape#11 P4 removes it there.
