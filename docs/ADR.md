@@ -123,7 +123,7 @@ Readiness signals, verified on 2026-10-16 against OpenClaw 2026.9.9 with read-on
    | `stopped` | unit inactive |
    | `starting` | unit active, `/readyz` not 200 yet, or not reachable, within the start window |
    | `ready` | `/readyz` 200 |
-   | `degraded` | `/readyz` 200, but a pinned plugin is not installed at the pinned sha256, or (optional, opt-in per member) `openclaw channels status --probe` reports a configured channel down |
+   | `degraded` | `/readyz` 200, but a pinned plugin is missing, disabled, not `loaded`, or its installed `version` differs from the version inside the pinned archive; or (opt-in per member) `openclaw channels status --json` (never `--probe`) reports a configured channel account not running; or any of these checks cannot be parsed |
    | `failed` | unit failed, or still not ready after the bounded wait |
 
    The probe reads only status fields. It never reads container env, logs content or
@@ -154,8 +154,12 @@ Readiness signals, verified on 2026-10-16 against OpenClaw 2026.9.9 with read-on
 
 - Is `openclaw channels status --probe` cheap and side-effect free enough for every
   `status` call, or only for `rollout`? Unverified.
-- How to read the *installed* plugin sha256 inside a member without side effects, e.g.
-  `openclaw plugins list --json` or hashing the installed package. Unverified.
+- Installed-package integrity: `openclaw plugins list --json` (2026.9.9, verified live
+  2026-10-19) reports `id`, `version`, `enabled`, `status` but no sha256. P1 therefore
+  compares versions. Whether `sync-plugins` should record the installed archive sha256
+  itself is decided in P2.
+- Live JSON shape of `openclaw channels status --json` is unverified; channel checking
+  stays off by default until a live sample is recorded.
 - Where do runtime pins (plugin sha, candidate IDs) live? This is #20 (M11). `rollout`
   must not need hand edits of the versioned inventory.
 - Backup scope for `rollout`: inventory plus per-member managed config only, or also
