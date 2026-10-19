@@ -43,6 +43,9 @@ class SystemdService:
     def disable(self, instance_name: str, execute: bool = False) -> CommandResult:
         return self._run(["systemctl", "--user", "disable", self.unit_name(instance_name)], execute)
 
+    def start(self, instance_name: str, execute: bool = False) -> CommandResult:
+        return self._run(["systemctl", "--user", "start", self.unit_name(instance_name)], execute)
+
     def restart(self, instance_name: str, execute: bool = False) -> CommandResult:
         return self._run(["systemctl", "--user", "restart", self.unit_name(instance_name)], execute)
 
