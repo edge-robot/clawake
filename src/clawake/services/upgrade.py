@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,14 +45,81 @@ def _find_instance(config: dict, instance_name: str) -> dict:
 
 
 def _format_image_value(key: str, value: str) -> str:
+    if not isinstance(value, str):
+        # Never render Python's ``None`` (or any non-string) into an inventory (#27).
+        raise ValueError(f"image.{key} must be a string, got {value!r}")
     return json.dumps(value) if key.endswith("tag") else value
 
 
-def _update_image_fields(
-    config_path: Path, instance_name: str, updates: dict[str, str], *, section: str = "instances"
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` atomically and keep its permission bits; never leave a partial file."""
+    mode = path.stat().st_mode & 0o7777
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        # Leave the previous inventory untouched and remove the partial file, then re-raise.
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _json_document(raw: str) -> dict | None:
+    """The parsed document if the inventory is JSON, else ``None`` (YAML)."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _update_json_image_fields(
+    config_path: Path,
+    data: dict,
+    instance_name: str,
+    updates: Mapping[str, str],
+    section: str,
 ) -> None:
-    """Update one image mapping without reformatting the rest of the YAML document."""
+    """Rewrite a JSON inventory as JSON: original key order, 2-space indent (#27)."""
+    entries = data.get(section)
+    if not isinstance(entries, list):
+        raise ValueError(f"Inventory {config_path} has no '{section}' list")
+    selected = next(
+        (item for item in entries if isinstance(item, dict) and item.get("name") == instance_name),
+        None,
+    )
+    if selected is None:
+        raise ValueError(f"Unknown instance '{instance_name}'")
+    image = selected.get("image")
+    if not isinstance(image, dict):
+        raise ValueError(f"Instance '{instance_name}' does not define image")
+    image.update(updates)
+    _write_text_atomic(config_path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def _update_image_fields(
+    config_path: Path,
+    instance_name: str,
+    updates: Mapping[str, str | None],
+    *,
+    section: str = "instances",
+) -> None:
+    """Update one image mapping without reformatting the rest of the document.
+
+    JSON inventories stay JSON; YAML inventories keep their formatting. A ``None`` value is
+    never written: the key is left as it is (#27).
+    """
+    values = {key: value for key, value in updates.items() if value is not None}
     raw = config_path.read_text(encoding="utf-8")
+    json_data = _json_document(raw)
+    if json_data is not None:
+        _update_json_image_fields(config_path, json_data, instance_name, values, section)
+        return
     lines = raw.splitlines(keepends=True)
     document = yaml.compose(raw)
     instances = next(value for key, value in document.value if key.value == section)
@@ -81,7 +151,7 @@ def _update_image_fields(
     if image_node.flow_style:
         data = yaml.safe_load(raw)
         image = dict(next(item for item in data[section] if item["name"] == instance_name)["image"])
-        image.update(updates)
+        image.update(values)
         replacement = yaml.safe_dump(image, default_flow_style=True, sort_keys=False).strip()
         config_path.write_text(
             raw[: image_node.start_mark.index] + replacement + raw[image_node.end_mark.index :],
@@ -105,7 +175,7 @@ def _update_image_fields(
         if match and len(match.group(1)) == child_indent:
             positions[match.group(2)] = index
 
-    for key, value in updates.items():
+    for key, value in values.items():
         rendered = f"{' ' * child_indent}{key}: {_format_image_value(key, value)}\n"
         if key in positions:
             lines[positions[key]] = rendered
@@ -260,6 +330,7 @@ def rollback_to_known_good(config_path: Path, instance_name: str) -> UpgradePlan
 def backup_config(config_path: Path, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    backup_path = output_dir / f"{config_path.stem}-{stamp}.yaml"
+    # Keep the original suffix: a JSON inventory is backed up as .json (#27).
+    backup_path = output_dir / f"{config_path.stem}-{stamp}{config_path.suffix}"
     backup_path.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
     return backup_path
