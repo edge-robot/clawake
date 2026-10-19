@@ -485,6 +485,13 @@ only ever an env SecretRef. Format and rules are in `docs/inventory-v2.md`, sect
 - `setup` (preview and `--execute`) exits with code 2 if `token_env` is not a key in any
   of the member's `env_files`. Only key names are parsed; values are never read into
   output, errors or the ledger.
+- `token_env` must match `^[A-Z][A-Z0-9_]{0,127}$`, the OpenClaw SecretRef id pattern;
+  `validate` rejects a leading underscore or a name longer than 128 characters.
+- Every enabled member gets `configWrites: false`, so `/config set` and `/config unset`
+  from Discord cannot change the OpenClaw config. This is fixed and not configurable.
+  A member whose `channels/discord` is already owned shows
+  `channels/discord/configWrites (added)` in the next `setup` preview and is restarted
+  once.
 - The preview prints changed key paths below `channels/discord` with IDs as `<id>` and
   `(added)`, `(removed)` or `(changed)` markers. It never prints values.
 - After Clawake owns the object, a change made through `openclaw config patch`, the UI or

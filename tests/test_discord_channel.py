@@ -284,6 +284,14 @@ INVALID = [
     ("token_env_lowercase", _spec(token_env="discord_token"), "token_env"),
     ("token_env_dollar", _spec(token_env="${DISCORD_BOT_TOKEN}"), "token_env"),
     ("token_env_missing", {"enabled": True, "guilds": []}, "token_env is required"),
+    # OpenClaw SecretRef id pattern ^[A-Z][A-Z0-9_]{0,127}$ (follow-up 2026-10-19).
+    ("token_env_leading_underscore", _spec(token_env="_DISCORD_BOT_TOKEN"), "token_env"),
+    ("token_env_leading_digit", _spec(token_env="1DISCORD"), "token_env"),
+    ("token_env_129_chars", _spec(token_env="D" * 129), "token_env"),
+    # configWrites is fixed to false and never configurable (ADR-005 amendment item 8).
+    ("config_writes_snake", _spec(config_writes=True), "Extra inputs"),
+    ("config_writes_camel", _spec(configWrites=True), "Extra inputs"),
+    ("disabled_config_writes", {"enabled": False, "config_writes": False}, "Extra inputs"),
     ("token_literal", _spec(token="x"), "Extra inputs"),
     ("accounts", _spec(accounts={}), "Extra inputs"),
 ]
@@ -323,6 +331,8 @@ VALID = [
     ("dm_pairing", _spec(dm_policy="pairing")),
     ("no_guilds", _spec(guilds=[])),
     ("twenty_digits", _spec(application_id="1" * 20)),
+    ("token_env_128_chars", _spec(token_env="D" * 128)),
+    ("token_env_single_letter", _spec(token_env="D")),
 ]
 
 
@@ -410,6 +420,7 @@ def test_rendering_is_deterministic_and_uses_openclaw_names(tmp_path: Path) -> N
         "dmPolicy",
         "allowFrom",
         "groupPolicy",
+        "configWrites",
         "guilds",
     ]
     guild = first["guilds"][GUILD]
@@ -443,6 +454,7 @@ def test_rendering_omits_empty_lists_and_unset_optionals(tmp_path: Path) -> None
         "token": SECRET_REF,
         "dmPolicy": "disabled",
         "groupPolicy": "allowlist",
+        "configWrites": False,
         "guilds": {
             GUILD: {
                 "requireMention": True,
@@ -451,6 +463,19 @@ def test_rendering_omits_empty_lists_and_unset_optionals(tmp_path: Path) -> None
             }
         },
     }
+
+
+def test_enabled_render_always_disables_config_writes(tmp_path: Path) -> None:
+    # ADR-005 amendment item 8: chat-initiated /config set|unset must stay off.
+    minimal = DiscordSpec.model_validate(_spec(guilds=[]))
+    cfg = _team(tmp_path)
+    inventory = load_inventory(cfg)
+    lead, engineer = inventory.instances
+
+    assert minimal.runtime_config()["configWrites"] is False
+    assert desired_fields(inventory, lead)["channels/discord"]["configWrites"] is False
+    assert DiscordSpec.model_validate({"enabled": False}).runtime_config() == {"enabled": False}
+    assert desired_fields(inventory, engineer)["channels/discord"] == {"enabled": False}
 
 
 def test_member_without_discord_leaves_channels_discord_unowned(tmp_path: Path) -> None:
@@ -637,7 +662,7 @@ def test_adoption_preview_redacts_ids_and_mutates_nothing(tmp_path: Path, host: 
     out = result.output
     assert (
         "channels/discord/allowFrom (added), channels/discord/applicationId (added), "
-        "channels/discord/dmPolicy (added), "
+        "channels/discord/configWrites (added), channels/discord/dmPolicy (added), "
         "channels/discord/guilds/<id>/channels/<id>/requireMention (added), "
         "channels/discord/guilds/<id>/channels/<id>/users (added), "
         "channels/discord/guilds/<id>/requireMention (added), "

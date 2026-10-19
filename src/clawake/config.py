@@ -427,6 +427,9 @@ class McpServerSpec(BaseModel):
 
 
 ENV_NAME_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
+# OpenClaw config schema, env SecretRef ``id`` (OpenClaw 2026.9.9, ADR-005 amendment
+# item 7). Stricter than ENV_NAME_PATTERN: no leading underscore, at most 128 characters.
+DISCORD_TOKEN_ENV_PATTERN = r"^[A-Z][A-Z0-9_]{0,127}$"
 _SNOWFLAKE = re.compile(r"[0-9]{17,20}")
 
 
@@ -477,7 +480,7 @@ class DiscordSpec(BaseModel):
     """
 
     enabled: bool = True
-    token_env: str | None = Field(default=None, pattern=ENV_NAME_PATTERN)
+    token_env: str | None = Field(default=None, pattern=DISCORD_TOKEN_ENV_PATTERN)
     application_id: Snowflake | None = None
     dm_policy: Literal["disabled", "allowlist", "pairing"] = "disabled"
     allow_from: SnowflakeList = Field(default_factory=list)
@@ -549,6 +552,10 @@ class DiscordSpec(BaseModel):
         if self.allow_from:
             config["allowFrom"] = list(self.allow_from)
         config["groupPolicy"] = self.group_policy
+        # Fixed, not configurable (ADR-005 amendment item 8): OpenClaw enables
+        # channel-initiated /config set|unset by default; config changes go through the
+        # inventory and setup only.
+        config["configWrites"] = False
         guilds: dict = {}
         for guild in self.guilds:
             entry: dict = {"requireMention": guild.require_mention}

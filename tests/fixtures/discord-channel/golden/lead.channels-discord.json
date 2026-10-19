@@ -12,6 +12,7 @@
     "100000000000000004"
   ],
   "groupPolicy": "allowlist",
+  "configWrites": false,
   "guilds": {
     "100000000000000001": {
       "requireMention": true,

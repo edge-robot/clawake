@@ -338,7 +338,7 @@ openclaw:
 | Key | Type | Default | Rule |
 |---|---|---|---|
 | `enabled` | bool | `true` | `false` renders `{"enabled": false}`; no other key is allowed |
-| `token_env` | env name `^[A-Z_][A-Z0-9_]*$` | none | required when enabled; `setup` checks that it is a key in one of the member's `env_files` |
+| `token_env` | env name `^[A-Z][A-Z0-9_]{0,127}$` (OpenClaw SecretRef id) | none | required when enabled; `setup` checks that it is a key in one of the member's `env_files` |
 | `application_id` | snowflake | unset | optional |
 | `dm_policy` | `disabled` \| `allowlist` \| `pairing` | `disabled` | `open` is not offered |
 | `allow_from` | list of snowflakes | `[]` | required and non-empty with `dm_policy: allowlist`, forbidden otherwise |
@@ -353,7 +353,7 @@ openclaw:
 
 - **Snowflakes.** After substitution, every ID must match `^[0-9]{17,20}$` and be a YAML
   string: quote literal IDs, and quote references inside flow lists (`["${site:x}"]`). Names, tags, `*` and `dangerouslyAllowNameMatching` are rejected, and so are
-  unknown keys such as `token` or `accounts`.
+  unknown keys such as `token`, `accounts` or `config_writes` / `configWrites`.
 - **Allowlist rule (#21).** With `group_policy: allowlist`:
   - every enabled channel needs non-empty `users` or `roles`, either its own or its
     guild's;
@@ -361,9 +361,14 @@ openclaw:
     allows every channel of that guild.
 - **Rendering.**
   - OpenClaw key names: `enabled`, `token`, `applicationId`, `dmPolicy`, `allowFrom`,
-    `groupPolicy`, and `guilds.<id>` with `requireMention`, `users`, `roles` and
-    `channels.<id>.{enabled,requireMention,users,roles}`.
+    `groupPolicy`, `configWrites`, and `guilds.<id>` with `requireMention`, `users`,
+    `roles` and `channels.<id>.{enabled,requireMention,users,roles}`.
   - `token` is always `{"source": "env", "provider": "default", "id": <token_env>}`.
+  - `configWrites` is always `false` for an enabled member and cannot be set in the
+    inventory. OpenClaw enables channel-initiated config writes (`/config set`,
+    `/config unset` from Discord) by default; config changes go through the inventory
+    and `setup` only (ADR-005 amendment, item 8). A disabled member still renders only
+    `{"enabled": false}`.
   - Empty lists and unset optionals are omitted.
 - **Ownership.**
   - A member without `discord` leaves `channels.discord` untouched and unowned.
