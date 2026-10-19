@@ -376,3 +376,100 @@ overlay file instead of the versioned inventory. The format and rules are in
 
 To roll back the overlay, copy a file from `pins-backups/` over `pins.json`
 (`install -m 0600 <backup> pins.json`) and re-run the previews.
+
+## One-step `rollout` (ADR-003 item 5, ADR-004)
+
+```text
+clawake rollout -c <inventory> [-m <member>]... [--plugin <id>=<path-to-tgz>]... [--execute]
+```
+
+`rollout` reconciles the selected v1 members (default: the whole team) in one reviewed
+operation: setup actions, plugin sync, and optionally new archive plugin pins. It never
+changes images; `upgrade` stays the image path. v2 inventories exit with code 2.
+
+### Request checks (exit code 2, before any host access)
+
+- `-m` names an unknown member.
+- `--plugin` is not `<id>=<path>`, or the same id is given twice.
+- `--plugin` is used but the inventory has no `runtime_pins`. Run `clawake pins init` first
+  (see "Runtime pins").
+- The plugin id is not declared on any selected member, or is declared as an npm plugin.
+  A `--plugin` applies to every selected member that declares the id.
+- The archive does not exist, is not readable, or has no readable `version` in
+  `package/package.json`.
+- The candidate state is invalid. This includes a conflict when the inventory itself still
+  carries `artifact_path`/`sha256` for the plugin; remove those fields from the inventory
+  (step 5 of the migration).
+
+The candidate state is the inventory plus the overlay plus the new pins, validated in
+memory exactly as `load_inventory` would. The overlay is not written yet.
+
+### Preview
+
+The preview reads host state only (rendered files, `systemctl --user status`, the readiness
+probe, the plugin ledger, the managed config). Per member it prints:
+
+```text
+Member example-lead:
+  readiness now: ready
+  setup: restart (example-lead.container)
+  plugin example-cad: 1.2.3 (sha256:d93bcc4e3ea0) -> 1.2.4 (sha256:86c0abb6a376)
+    action: install (digest_changed, version_mismatch)
+  grants: managed plugin config and agent grants unchanged
+  backup: .backups/example-lead-<UTC timestamp>.tar.gz
+Overlay backup: .backups/pins-<UTC timestamp>.json
+Order with --execute: all backups first; then one member at a time: ...
+Members to restart: example-lead
+DRY RUN rollout complete. Re-run with --execute.
+```
+
+`readiness now` is measured against the committed pins. The `action:` line uses the
+`sync-plugins` rules against the candidate pins. A plugin without a new pin shows
+`unchanged pin`. A member without any planned change shows `backup: none (no change
+planned)` and is not backed up.
+
+### `--execute`
+
+1. **Backups first.** One `backup_instance` archive per member that will change (when
+   `backup_policy.enabled` and `pre_mutation`), plus a 0600 copy of the current overlay
+   when pins change, all in `.backups/` of the working directory. A failed backup aborts
+   before anything is deployed.
+2. **Per member, in inventory order:** deploy the rendered candidate files, run
+   `daemon-reload` (only if files changed), run the setup action (`restart` / `start` /
+   `none`) and wait for readiness within the start window, then run the `sync-plugins`
+   steps (install or skip, ledger, config/grants, restart only on change, wait, verify the
+   pinned version).
+3. **Commit pins.** Only after the member verified, its new pins are written to the
+   overlay in one atomic write (the previous overlay goes to `pins-backups/`).
+4. **Stop at the first failure.** Later members are not touched and keep their committed
+   pins; the failed member keeps its old pins in the overlay. Clawake prints:
+
+   ```text
+   Rollout stopped at example-lead: plugin sync or verification failed. Later members were not touched.
+   The deployed state of example-lead now differs from the committed runtime pins.
+   Backups: .backups/example-lead-20261019T101439Z.tar.gz, .backups/pins-20261019T101439.342141Z.json
+   To return to the committed pins, run: clawake rollout -c deploy/team.json -m example-lead --execute
+   ```
+
+   and exits with code 1. The suggested command (without `--plugin`) redeploys the
+   committed pins.
+
+The summary table is printed on success and on failure:
+
+```text
+Rollout summary:
+  member        setup    plugin       action   version       digest               result  readiness  ready_s  pins
+  example-lead  restart  example-cad  install  1.2.3->1.2.4  sha256:86c0abb6a376  ok      ready      46       yes
+  example-dev   none     example-cad  skip     1.2.3         sha256:d93bcc4e3ea0  ok      ready      -        -
+```
+
+`pins` is `yes` (committed), `no` (a new pin was not committed) or `-` (no new pin).
+A plugin rollout restarts a member twice: once for the new archive mount, once after the
+install. Expect about 2 × 46–60 s per member.
+
+Re-running the same command after a successful rollout is a no-op: `skip`, no restart,
+no backup, no overlay write. `rollout` without `--plugin` on an unchanged team is a no-op
+too.
+
+Differences from `setup`: `rollout` does not retire legacy services and does not check
+A2A environment files (it never reads secrets). Run `setup` for those.
