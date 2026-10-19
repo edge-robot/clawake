@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Literal
@@ -20,6 +21,12 @@ from clawake.inventory_validation import (
     single_line,
     target_path,
     validate_v2_inventory,
+)
+from clawake.services.runtime_pins import (
+    apply_overlay,
+    read_overlay_file,
+    resolve_pins_path,
+    validate_overlay,
 )
 
 
@@ -564,6 +571,8 @@ class Inventory(BaseModel):
     instances: list[InstanceSpec]
     networks: list[NetworkSpec] = Field(default_factory=list)
     services: list[ServiceSpec] = Field(default_factory=list)
+    # ADR-004: path of the private runtime pin overlay; load_inventory() resolves and applies it.
+    runtime_pins: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -629,6 +638,8 @@ class Inventory(BaseModel):
                 f"cluster.primary_host '{self.cluster.primary_host}' does not match any host"
             )
 
+        if self.version != 1 and self.runtime_pins is not None:
+            raise ValueError(RUNTIME_PINS_V1_ONLY)
         if self.version == 1:
             if self.services or any(item.depends_on for item in self.instances):
                 raise ValueError("Services and dependencies require inventory version 2")
@@ -822,8 +833,24 @@ def _expand_string_values(value: object, env: Mapping[str, str]) -> object:
     return value
 
 
-def load_inventory(path: str | Path) -> Inventory:
-    inventory_path = Path(path)
+RUNTIME_PINS_V1_ONLY = (
+    "runtime_pins is only supported in inventory version 1; v2 rollout does not exist yet"
+)
+
+
+@dataclass(frozen=True)
+class InventoryLayers:
+    """An inventory as loaded: raw expanded data, optional runtime pin overlay, effective model."""
+
+    inventory_path: Path
+    raw: dict
+    pins_path: Path | None
+    overlay: dict | None
+    merged: dict
+    inventory: Inventory
+
+
+def _expanded_inventory_data(inventory_path: Path) -> dict:
     data = yaml.safe_load(inventory_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Inventory file must contain a YAML mapping")
@@ -843,5 +870,38 @@ def load_inventory(path: str | Path) -> Inventory:
         # should use CLAWAKE_PROJECT_ROOT because it names the value accurately.
         "CLAWAKE_WORKSPACE_ROOT": configured_project_root,
     }
-    expanded_data = _expand_string_values(data, expansion_env)
-    return Inventory.model_validate(expanded_data)
+    expanded = _expand_string_values(data, expansion_env)
+    assert isinstance(expanded, dict)
+    return expanded
+
+
+def load_inventory_layers(path: str | Path, *, allow_missing_pins: bool = False) -> InventoryLayers:
+    """Load an inventory and apply its runtime pin overlay (ADR-004) before validation.
+
+    ``allow_missing_pins`` is reserved for the migration command (``clawake pins init``).
+    """
+    inventory_path = Path(path)
+    raw = _expanded_inventory_data(inventory_path)
+    reference = raw.get("runtime_pins")
+    if reference is None:
+        return InventoryLayers(inventory_path, raw, None, None, raw, Inventory.model_validate(raw))
+    if raw.get("version", 1) != 1:
+        raise ValueError(RUNTIME_PINS_V1_ONLY)
+    if not isinstance(reference, str) or not reference.strip():
+        raise ValueError("runtime_pins must be a non-empty path")
+    pins_path = resolve_pins_path(reference, inventory_path)
+    if allow_missing_pins and not os.path.lexists(pins_path):
+        merged = {**raw, "runtime_pins": str(pins_path)}
+        return InventoryLayers(
+            inventory_path, raw, pins_path, None, merged, Inventory.model_validate(merged)
+        )
+    overlay = validate_overlay(read_overlay_file(pins_path), raw, pins_path)
+    merged = apply_overlay(raw, overlay, inventory_source=inventory_path, overlay_source=pins_path)
+    merged["runtime_pins"] = str(pins_path)
+    return InventoryLayers(
+        inventory_path, raw, pins_path, overlay, merged, Inventory.model_validate(merged)
+    )
+
+
+def load_inventory(path: str | Path, *, allow_missing_pins: bool = False) -> Inventory:
+    return load_inventory_layers(path, allow_missing_pins=allow_missing_pins).inventory

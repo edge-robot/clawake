@@ -340,3 +340,57 @@ def test_v2_setup_prepares_state_path_not_workspace_openclaw(tmp_path: Path, mon
     lead = _member(inventory, "example-lead")
     assert lead.runtime_state_path.is_dir()
     assert not (Path(lead.workspace_path) / ".openclaw").exists()
+
+
+def _rendered_artifacts(inventory_path: Path) -> dict[str, str]:
+    """Quadlets and runtime plans of an inventory loaded through load_inventory (overlay-aware)."""
+    inventory = load_inventory(inventory_path)
+    artifacts: dict[str, str] = {}
+    for network in inventory.networks:
+        artifacts[f"quadlet/{network.quadlet_path}"] = render_shared_network(network)
+    for instance in inventory.instances:
+        for path, content in render_instance_assets(instance, TEMPLATES).items():
+            artifacts[f"quadlet/{path}"] = content
+        artifacts[f"runtime/{instance.name}.desired.json"] = (
+            json.dumps(desired_fields(inventory, instance), indent=2, sort_keys=True) + "\n"
+        )
+        for path, content, _previous, _keys in plan_runtime_files(inventory, instance):
+            artifacts[f"runtime/{instance.name}.{path.name}"] = content
+    return artifacts
+
+
+def test_split_inventory_and_overlay_render_identically_to_fixture(tmp_path: Path) -> None:
+    """ADR-004: inventory + runtime pin overlay is byte-identical to the fully pinned fixture."""
+    split = _raw()
+    overlay: dict = {"version": 1, "cluster": split["cluster"]["name"], "members": {}}
+    for member in split["instances"]:
+        image = {
+            key: member["image"].pop(key)
+            for key in ("tag", "digest", "known_good_tag", "known_good_digest")
+        }
+        plugins = {
+            plugin["id"]: {
+                "artifact_path": plugin.pop("artifact_path"),
+                "sha256": plugin.pop("sha256"),
+            }
+            for plugin in member["plugins"]
+        }
+        overlay["members"][member["name"]] = {"image": image, "plugins": plugins}
+    split["runtime_pins"] = "private/pins.json"
+    split_path = tmp_path / "team.yml"
+    split_path.write_text(yaml.safe_dump(split, sort_keys=False), encoding="utf-8")
+    pins = tmp_path / "private" / "pins.json"
+    pins.parent.mkdir()
+    pins.write_text(json.dumps(overlay, indent=2), encoding="utf-8")
+    pins.chmod(0o600)
+    assert "sha256" not in split_path.read_text(encoding="utf-8")
+
+    expected = _rendered_artifacts(INVENTORY)
+    actual = _rendered_artifacts(split_path)
+
+    assert sorted(actual) == sorted(expected)
+    for relative, content in expected.items():
+        assert actual[relative] == content, relative
+    for relative, content in expected.items():
+        if relative.startswith("quadlet/"):
+            assert content == (GOLDEN / relative).read_text(encoding="utf-8"), relative
