@@ -564,6 +564,14 @@ with a plaintext string `token`.
 4. **Read-only checks:**
    - `clawake validate -c deploy/team.yml` prints
      `site values: <path> (3 values, 3 references)` and no `unused values` warning.
+     `validate` never writes and never adopts. It plans with the pending adoptions and
+     prints one notice per member, with exit 0:
+     `pending adoption: <member> discord-channel (review with: clawake setup -c
+     deploy/team.yml --adopt discord-channel)`. If an adoption precondition fails (for
+     example a plaintext string token), it prints `Error: Cannot adopt channels/discord of
+     member <member>: ...` and exits 1. Any other planning refusal, such as the drift guard
+     (`Error: Managed field changed outside Clawake: channels/discord`), is also an
+     `Error: <message>` with exit 1.
    - `clawake setup -c deploy/team.yml` (no flag) stops with
      `Refusing to overwrite unmanaged OpenClaw field: channels/discord (named adoption
      'discord-channel': review the preview, then run setup with --adopt discord-channel)`.
