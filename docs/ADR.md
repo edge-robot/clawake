@@ -361,10 +361,13 @@ data. (C) is not reviewable, not validated and differs per shell.
 
 ### Open decisions
 
-- **ClawOnshape bindings** (`requesterSenderId`, `discordChannelId`, approver set):
-  either ClawOnshape's plugin `config` uses `${site:…}` references, or the plugin reads
-  the binding from the rendered channel config. Owned by edge-robot/clawonshape
-  (#11 P4); Clawake only provides the substitution.
+- ~~**ClawOnshape bindings**~~ — **decided 2026-10-19** in edge-robot/clawonshape
+  `docs/ADR.md` ADR-2026-10-19 (option A): plugin bindings (`requesterSenderId`,
+  `discordChannelId`, approver set) use `${site:…}` references in plugin `config`. Shared
+  site value names: `discord.guild`, `discord.lead_channel`, `discord.requester`,
+  `discord.approvers` (list), `discord.dm_allow` (list), `discord.application_id`;
+  `onshape.document`, `onshape.workspace`, `onshape.element` are ClawOnshape-only.
+  Clawake only provides the substitution.
 - **OpenClaw config rewrites** are documented, not live-verified. Before #24 relies on
   unattended `rollout`, verify on the deployed OpenClaw version that a pairing approval
   and a gateway restart leave `channels.discord` byte-identical.
