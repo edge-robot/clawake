@@ -301,8 +301,8 @@ data. (C) is not reviewable, not validated and differs per shell.
      enabled: true
      token_env: DISCORD_BOT_TOKEN        # name only, never a value
      application_id: ${site:discord.application_id}   # optional
-     dm_policy: disabled                 # disabled | allowlist | pairing; no "open"
-     allow_from: ${site:discord.dm_allow}            # required iff dm_policy=allowlist
+     dm_policy: allowlist                # disabled (default) | allowlist | pairing; no "open"
+     allow_from: ${site:discord.dm_allow}            # required iff dm_policy=allowlist, else forbidden
      group_policy: allowlist             # allowlist | disabled; no "open"
      guilds:
        - id: ${site:discord.guild}
@@ -368,3 +368,28 @@ data. (C) is not reviewable, not validated and differs per shell.
 - **OpenClaw config rewrites** are documented, not live-verified. Before #24 relies on
   unattended `rollout`, verify on the deployed OpenClaw version that a pairing approval
   and a gateway restart leave `channels.discord` byte-identical.
+
+### Amendment 2026-10-19 (user decision): OpenClaw schema alignment and `configWrites`
+
+Facts from the live OpenClaw config JSON schema (`openclaw config schema`, deployed
+OpenClaw 2026.9.9, read by the architect 2026-10-19; schema only, no config values):
+
+- The schema is strict: `additionalProperties: false` on `channels.discord`, on
+  `guilds.<id>` and on `guilds.<id>.channels.<id>`. A key OpenClaw does not know makes
+  the whole config invalid. Every rendered key must therefore exist in the schema.
+- Confirmed keys: top-level `applicationId`; per-guild and per-channel `requireMention`,
+  `users`, `roles`; per-channel `enabled`.
+- The env SecretRef `id` must match `^[A-Z][A-Z0-9_]{0,127}$`.
+- `channels.discord.configWrites` exists. Per docs.openclaw.ai `/channels/discord/events`
+  ("Config writes"), channel-initiated config writes (`/config set`, `/config unset`)
+  are **enabled by default**.
+
+Decisions:
+
+7. **`token_env`** must match the SecretRef id pattern `^[A-Z][A-Z0-9_]{0,127}$`.
+8. **`configWrites: false`** is always rendered for an enabled member. It is not
+   configurable in the inventory. Config changes go through the inventory and `setup`,
+   never through chat. This also keeps the ledger-owned `channels/discord` free of
+   channel-initiated drift.
+9. References inside YAML flow lists must be quoted (`["${site:x}"]`); unquoted
+   `[${site:x}]` is a YAML parse error.
