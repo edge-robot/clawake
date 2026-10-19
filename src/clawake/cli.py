@@ -3,13 +3,20 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import warnings
 from pathlib import Path
 from typing import Annotated, Literal
 
 import typer
 import yaml
 
-from clawake.config import ImageSpec, InstanceSpec, Inventory, load_inventory
+from clawake.config import (
+    ImageSpec,
+    InstanceSpec,
+    Inventory,
+    InventoryLayers,
+    load_inventory_layers,
+)
 from clawake.inventory_validation import require_v1_runtime
 from clawake.services.backup import backup_instance, prune_backups
 from clawake.services.deployment import ArtifactChange, apply_artifacts, plan_deployment
@@ -29,6 +36,13 @@ from clawake.services.readiness import (
     probe_member,
     wait_members_ready,
 )
+from clawake.services.runtime_pins import (
+    RuntimePinsWarning,
+    count_fields,
+    execute_init,
+    pin_rows,
+    plan_init,
+)
 from clawake.services.runtime_upgrade import (
     doctor_command,
     ensure_browser_cache,
@@ -37,7 +51,12 @@ from clawake.services.runtime_upgrade import (
     verify_runtime,
 )
 from clawake.services.systemd import CommandResult, SystemdService
-from clawake.services.upgrade import apply_upgrade, backup_config, build_upgrade_plan
+from clawake.services.upgrade import (
+    apply_upgrade,
+    backup_config,
+    build_upgrade_plan,
+    plan_overlay_upgrade,
+)
 
 app = typer.Typer(
     help="Deploy and operate OpenClaw teams. Changes are previewed unless --execute is set.",
@@ -65,11 +84,26 @@ _ENV_LINE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
 
 def _load(path: Path, *, validation_only: bool = False) -> Inventory:
+    return _load_layers(path, validation_only=validation_only).inventory
+
+
+def _load_layers(
+    path: Path, *, validation_only: bool = False, allow_missing_pins: bool = False
+) -> InventoryLayers:
     try:
-        inventory = load_inventory(path)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimePinsWarning)
+            layers = load_inventory_layers(path, allow_missing_pins=allow_missing_pins)
+        for warning in caught:
+            if issubclass(warning.category, RuntimePinsWarning):
+                typer.echo(f"WARNING: {warning.message}", err=True)
+            else:
+                warnings.warn_explicit(
+                    warning.message, warning.category, warning.filename, warning.lineno
+                )
         if not validation_only:
-            require_v1_runtime(inventory)
-        return inventory
+            require_v1_runtime(layers.inventory)
+        return layers
     except yaml.YAMLError as exc:
         # Parser excerpts can contain credentials mistakenly placed in an inventory.
         mark = getattr(exc, "problem_mark", None)
@@ -353,7 +387,12 @@ def upgrade_member(
             "Clawake will not follow an unpinned image tag."
         )
 
-    plan = build_upgrade_plan(config, member, target_tag, target_digest)
+    try:
+        plan = build_upgrade_plan(config, member, target_tag, target_digest)
+        # ADR-004: with runtime_pins the image fields go to the overlay; validate that write now.
+        pins_path = plan_overlay_upgrade(config, member, target_tag, target_digest)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(f"Cannot plan upgrade: {exc}", param_hint="--config") from exc
     target = ImageSpec(
         repository=instance.image.repository,
         tag=plan.next_tag,
@@ -367,6 +406,8 @@ def upgrade_member(
     typer.echo(f"  image: {plan.previous_tag} -> {plan.next_tag}")
     typer.echo(f"  digest: {plan.previous_digest or 'unpinned'} -> {plan.next_digest}")
     typer.echo(f"  backup: {'yes' if instance.backup_policy.pre_mutation else 'no'}")
+    if pins_path is not None:
+        typer.echo(f"  pins: {pins_path} (inventory file is not modified)")
     typer.echo(f"  migration: {' '.join(doctor_command(instance, target)[-5:])}")
     typer.echo(f"  health: {_dashboard_host_url(instance).rstrip('/')}{instance.health.path}")
     typer.echo(f"  readiness wait: up to {instance.readiness.start_window_seconds}s")
@@ -383,6 +424,7 @@ def upgrade_member(
     config_changed = False
     runtime_backup: Path | None = None
     config_backup: Path | None = None
+    pins_backup: Path | None = None
 
     try:
         typer.echo("Verifying pinned image in registry...")
@@ -410,8 +452,14 @@ def upgrade_member(
             details = doctor_result.stderr.strip() or doctor_result.stdout.strip()
             raise RuntimeError(f"OpenClaw migration failed: {details}")
 
-        apply_upgrade(config, instance.name, target.tag, target.digest)
+        with warnings.catch_warnings():
+            # Overlay permission warnings were already reported when the inventory was loaded.
+            warnings.simplefilter("ignore", RuntimePinsWarning)
+            applied = apply_upgrade(config, instance.name, target.tag, target.digest)
         config_changed = True
+        pins_backup = applied.pins_backup
+        if pins_backup is not None:
+            typer.echo(f"Updated runtime pins; previous pins: {pins_backup}")
         updated_inventory = _load(config)
         updated_instance = _instance_by_name(updated_inventory, member)
         # Doctor may have migrated the configuration. Recompute the same plan against it.
@@ -465,6 +513,8 @@ def upgrade_member(
             typer.echo(f"Runtime recovery archive: {runtime_backup}", err=True)
         if config_backup:
             typer.echo(f"Config recovery file: {config_backup}", err=True)
+        if pins_backup:
+            typer.echo(f"Runtime pins recovery file: {pins_backup}", err=True)
         typer.echo(
             f"Inspect logs with: journalctl --user-unit {service.unit_name(instance.name)} -n 100",
             err=True,
@@ -944,7 +994,8 @@ def teardown_quadlets(
 @app.command("validate")
 def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) -> None:
     """Validate desired state offline; v2 is model-only until service rendering exists."""
-    inventory = _load(config, validation_only=True)
+    layers = _load_layers(config, validation_only=True)
+    inventory = layers.inventory
     selected = _select_instances(inventory, member)
     if inventory.version == 2:
         typer.echo(
@@ -958,6 +1009,9 @@ def validate_inventory(config: ConfigPath, member: OptionalMemberName = None) ->
         f"Valid inventory: {inventory.cluster.name}; {len(selected)} member(s), "
         f"{len(changes)} artifact change(s)."
     )
+    if layers.overlay is not None:
+        members, fields = count_fields(layers.overlay)
+        typer.echo(f"runtime pins: {layers.pins_path} ({members} members, {fields} fields)")
 
 
 @app.command("upgrade-service")
@@ -1125,6 +1179,86 @@ def onshape_mcp(
             if result.return_code:
                 raise typer.BadParameter("Onshape MCP service start failed; inspect systemd")
         typer.echo("Onshape MCP service configured and started; credential readiness unverified")
+
+
+pins_app = typer.Typer(
+    help="Inspect and migrate the private runtime pin overlay (ADR-004).",
+    no_args_is_help=True,
+)
+app.add_typer(pins_app, name="pins")
+
+
+@pins_app.command("show")
+def pins_show(config: ConfigPath, format: StatusFormat = "text") -> None:
+    """Show effective image and plugin pins per member and where each value comes from."""
+    layers = _load_layers(config)
+    rows = pin_rows(layers.raw, layers.overlay)
+    members: dict[str, dict[str, dict[str, object]]] = {
+        instance.name: {} for instance in layers.inventory.instances
+    }
+    for row in rows:
+        members[row.member][row.field] = {
+            "value": row.value,
+            "source": row.source,
+            "also_in_inventory": row.also_in_inventory,
+        }
+    if format == "json":
+        payload = {
+            "cluster": layers.inventory.cluster.name,
+            "runtime_pins": str(layers.pins_path) if layers.pins_path else None,
+            "members": members,
+        }
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    typer.echo(f"runtime pins: {layers.pins_path or 'none declared'}")
+    for name, fields in members.items():
+        typer.echo(name)
+        for field_name, entry in fields.items():
+            source = str(entry["source"])
+            if entry["also_in_inventory"]:
+                source += ", also in inventory"
+            typer.echo(f"  {field_name} = {entry['value']} [{source}]")
+
+
+@pins_app.command("init")
+def pins_init(
+    config: ConfigPath,
+    output: Annotated[
+        Path, typer.Option(..., "--output", help="New overlay file; never overwritten.")
+    ],
+    execute: ExecuteFlag = False,
+) -> None:
+    """Extract the current pins into a new overlay. Never edits the inventory."""
+    _load_layers(config, allow_missing_pins=True)
+    try:
+        with warnings.catch_warnings():
+            # Overlay permission warnings were already reported by _load_layers.
+            warnings.simplefilter("ignore", RuntimePinsWarning)
+            plan = plan_init(config, output)
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--output") from exc
+    typer.echo(f"Runtime pins overlay to write: {plan.output} (mode 0600)")
+    typer.echo(plan.content, nl=False)
+    typer.echo(f"Then remove these {len(plan.removals)} field(s) from {config}:")
+    for removal in plan.removals:
+        typer.echo(f"  - {removal}")
+    if plan.already_declared is not None:
+        typer.echo(f"runtime_pins already declared: {plan.already_declared}")
+        if plan.already_declared != plan.output:
+            typer.echo(f"Then change it to: {plan.reference_line}")
+    else:
+        typer.echo("And add this top-level line:")
+        typer.echo(f"  {plan.reference_line}")
+    typer.echo(f"Verify with: clawake validate -c {config} and clawake pins show -c {config}")
+    if not execute:
+        typer.echo("DRY RUN; the inventory is never edited. Re-run with --execute to write.")
+        return
+    try:
+        execute_init(plan)
+    except (ValueError, OSError) as exc:
+        typer.echo(f"Writing runtime pins failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Wrote {plan.output}. The inventory {config} was not modified.")
 
 
 if __name__ == "__main__":
