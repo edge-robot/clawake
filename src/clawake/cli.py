@@ -656,9 +656,13 @@ def upgrade_member(
         typer.echo(f"Running image: {runtime.image_name}")
         typer.echo(f"Health check: {health_details}")
         if runtime_backup:
-            prune_backups(backup_dir, f"{instance.name}-", instance.backup_policy.retention)
+            prune_backups(
+                backup_dir, instance.name, instance.backup_policy.retention, suffix=".tar.gz"
+            )
         if config_backup:
-            prune_backups(backup_dir, f"{config.stem}-", instance.backup_policy.retention)
+            prune_backups(
+                backup_dir, config.stem, instance.backup_policy.retention, suffix=config.suffix
+            )
     except (ImageCheckError, OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Upgrade failed: {exc}", err=True)
         if stopped and not config_changed:

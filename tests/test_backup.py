@@ -95,11 +95,11 @@ def test_backup_instance_skips_legacy_workspace_runtime_tree(tmp_path: Path) -> 
 def test_prune_backups_retains_newest_matching_files(tmp_path: Path) -> None:
     backups = tmp_path / "backups"
     backups.mkdir()
-    paths = [backups / f"one-{number}.tar.gz" for number in range(3)]
+    paths = [backups / f"one-2026102{number}T093015.000001Z.tar.gz" for number in range(3)]
     for path in paths:
         path.write_text(path.name, encoding="utf-8")
 
-    removed = prune_backups(backups, "one-", retention=2)
+    removed = prune_backups(backups, "one", retention=2, suffix=".tar.gz")
 
     assert removed == [paths[0]]
     assert not paths[0].exists()
@@ -156,3 +156,102 @@ def test_runtime_backup_fails_closed_when_the_archive_exists(tmp_path: Path) -> 
         backup_instance(instance, output, execute=True, now=_fixed_clock(_SAME_SECOND[0]))
 
     assert existing.read_bytes() == b"earlier archive"
+
+
+# --- #28: pruning selects exactly one member's or config's backups ----------------------------
+
+
+def _touch(directory: Path, *names: str) -> list[Path]:
+    paths = [directory / name for name in names]
+    for path in paths:
+        path.write_text(path.name, encoding="utf-8")
+    return paths
+
+
+def _names(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.iterdir())
+
+
+def test_pruning_member_a_keeps_every_backup_of_member_a_b(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    a_b = _touch(
+        backups,
+        "a-b-20261018T080000Z.tar.gz",
+        "a-b-20261019T080000.000001Z.tar.gz",
+        "a-b-20261020T080000.000001Z.tar.gz",
+    )
+    _touch(backups, "a-20261018T090000Z.tar.gz", "a-20261020T090000.000001Z.tar.gz")
+
+    removed = prune_backups(backups, "a", retention=1, suffix=".tar.gz")
+
+    assert [path.name for path in removed] == ["a-20261018T090000Z.tar.gz"]
+    assert all(path.exists() for path in a_b)
+    assert "a-20261020T090000.000001Z.tar.gz" in _names(backups)
+
+
+def test_pruning_handles_second_and_sub_second_names_by_their_timestamp(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    _touch(
+        backups,
+        "one-20261018T101439Z.tar.gz",  # old second-resolution name, oldest
+        "one-20261019T101439.342141Z.tar.gz",
+        "one-20261020T101439Z.tar.gz",  # old name, but the newest backup
+        "one-20261019T101439.342142Z.tar.gz",
+    )
+
+    removed = prune_backups(backups, "one", retention=2, suffix=".tar.gz")
+
+    assert sorted(path.name for path in removed) == [
+        "one-20261018T101439Z.tar.gz",
+        "one-20261019T101439.342141Z.tar.gz",
+    ]
+    assert _names(backups) == [
+        "one-20261019T101439.342142Z.tar.gz",
+        "one-20261020T101439Z.tar.gz",
+    ]
+
+
+def test_pruning_never_deletes_files_that_do_not_parse(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    unparseable = _touch(
+        backups,
+        "one-latest.tar.gz",
+        "one-20261020T101439Z.tar.gz.partial",
+        "one-20261020T101439.342Z.tar.gz",
+        "one-20261020T101439Z-1.tar.gz",
+        "one-20261320T101439Z.tar.gz",  # month 13
+        "one-20261019T101439Z.tgz",
+        "notes-one-20261019T101439Z.tar.gz",
+    )
+    _touch(backups, "one-20261019T101439Z.tar.gz", "one-20261020T101439Z.tar.gz")
+    (backups / "one-20261018T101439Z.tar.gz").symlink_to(backups / "one-latest.tar.gz")
+
+    removed = prune_backups(backups, "one", retention=1, suffix=".tar.gz")
+
+    assert [path.name for path in removed] == ["one-20261019T101439Z.tar.gz"]
+    assert all(path.exists() for path in unparseable)
+    assert (backups / "one-20261018T101439Z.tar.gz").is_symlink()
+
+
+def test_pruning_a_config_keeps_member_archives_and_other_configs(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    kept = _touch(
+        backups,
+        "team-20261018T101439Z.tar.gz",  # member named "team"
+        "team-b-20261018T101439Z.json",  # inventory team-b.json
+        "team-20261018T101439Z.yml",  # same stem, other suffix
+    )
+    _touch(backups, "team-20261018T101439Z.json", "team-20261019T101439.000001Z.json")
+
+    removed = prune_backups(backups, "team", retention=1, suffix=".json")
+
+    assert [path.name for path in removed] == ["team-20261018T101439Z.json"]
+    assert all(path.exists() for path in kept)
+
+
+def test_pruning_a_missing_directory_removes_nothing(tmp_path: Path) -> None:
+    assert prune_backups(tmp_path / "absent", "one", retention=1, suffix=".tar.gz") == []

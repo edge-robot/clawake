@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tarfile
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -15,6 +16,9 @@ Clock = Callable[[], datetime]
 
 # Sub-second UTC stamps, the same format as the runtime pins backups (#29).
 BACKUP_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
+# Names written before #29 have one-second stamps; pruning still recognises them (#28).
+LEGACY_BACKUP_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+_STAMP_PATTERN = r"(?P<stamp>\d{8}T\d{6}(?:\.\d{6})?Z)"
 PRIVATE_FILE_MODE = 0o600
 
 
@@ -153,14 +157,37 @@ def backup_instance(
     return archive_path
 
 
-def prune_backups(output_dir: Path, prefix: str, retention: int) -> list[Path]:
-    """Remove older matching backups while retaining the newest requested count."""
-    candidates = sorted(
-        (path for path in output_dir.glob(f"{prefix}*") if path.is_file()),
-        key=lambda path: (path.stat().st_mtime_ns, path.name),
-        reverse=True,
-    )
-    removed = candidates[retention:]
+def _parse_stamp(stamp: str) -> datetime | None:
+    """The UTC time of a backup stamp in either supported format, else ``None``."""
+    for pattern in (BACKUP_STAMP_FORMAT, LEGACY_BACKUP_STAMP_FORMAT):
+        try:
+            return datetime.strptime(stamp, pattern).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def prune_backups(output_dir: Path, name: str, retention: int, *, suffix: str) -> list[Path]:
+    """Remove older backups of exactly ``name`` and keep the newest ``retention`` ones.
+
+    Only regular files named ``<name>-<stamp><suffix>`` are candidates, with a second- or
+    sub-second-resolution stamp (#28). Anything else, including backups of ``<name>-<x>``,
+    is never deleted. Candidates are ordered by the time in their stamp.
+    """
+    if not output_dir.is_dir():
+        return []
+    pattern = re.compile(re.escape(f"{name}-") + _STAMP_PATTERN + re.escape(suffix))
+    candidates: list[tuple[datetime, str, Path]] = []
+    for entry in output_dir.iterdir():
+        match = pattern.fullmatch(entry.name)
+        if match is None or entry.is_symlink() or not entry.is_file():
+            continue
+        moment = _parse_stamp(match.group("stamp"))
+        if moment is None:
+            continue
+        candidates.append((moment, entry.name, entry))
+    candidates.sort(reverse=True)
+    removed = [entry for _moment, _name, entry in candidates[retention:]]
     for path in removed:
         path.unlink()
     return removed
