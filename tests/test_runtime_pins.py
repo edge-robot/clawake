@@ -894,3 +894,19 @@ def test_overlay_copy_is_not_mutated_by_merge(tmp_path: Path) -> None:
     )
 
     assert (raw, overlay) == snapshot
+
+
+def test_copy_overlay_creates_a_new_backup_directory_with_mode_0700(tmp_path: Path) -> None:
+    # #34: rollout may write the overlay copy before any runtime archive.
+    pins = tmp_path / "pins.json"
+    pins.write_text('{"version": 1}\n', encoding="utf-8")
+    pins.chmod(0o600)
+    output = tmp_path / "backups"
+    previous = os.umask(0o022)
+    try:
+        backup = runtime_pins.copy_overlay(pins, output)
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600

@@ -11,7 +11,12 @@ from pathlib import Path
 import yaml
 
 from clawake.services import runtime_pins
-from clawake.services.backup import Clock, backup_stamp, write_new_private_file
+from clawake.services.backup import (
+    BACKUP_DIR_MODE,
+    Clock,
+    backup_stamp,
+    write_new_private_file,
+)
 
 
 @dataclass
@@ -336,7 +341,8 @@ def rollback_to_known_good(config_path: Path, instance_name: str) -> UpgradePlan
 def backup_config(config_path: Path, output_dir: Path, *, now: Clock | None = None) -> Path:
     """Copy the inventory into ``output_dir`` as a new 0600 file; never overwrites (#29)."""
     content = config_path.read_bytes()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # A new backup directory is private (#34); backup_instance warns about an open one.
+    output_dir.mkdir(mode=BACKUP_DIR_MODE, parents=True, exist_ok=True)
     # Keep the original suffix: a JSON inventory is backed up as .json (#27).
     backup_path = output_dir / f"{config_path.stem}-{backup_stamp(now)}{config_path.suffix}"
     write_new_private_file(backup_path, content)

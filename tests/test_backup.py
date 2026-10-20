@@ -1,3 +1,5 @@
+import os
+import stat
 import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -255,3 +257,94 @@ def test_pruning_a_config_keeps_member_archives_and_other_configs(tmp_path: Path
 
 def test_pruning_a_missing_directory_removes_nothing(tmp_path: Path) -> None:
     assert prune_backups(tmp_path / "absent", "one", retention=1, suffix=".tar.gz") == []
+
+
+# --- #34: private runtime archives and backup directories --------------------------------------
+
+
+@pytest.fixture
+def permissive_umask():
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def test_runtime_archive_is_created_with_mode_0600(tmp_path: Path, permissive_umask) -> None:
+    instance = _small_instance(tmp_path)
+
+    archive = backup_instance(instance, tmp_path / "backups", execute=True)
+
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    with tarfile.open(archive, "r:gz") as tar:
+        assert any(name.endswith("/README.txt") for name in tar.getnames())
+
+
+def test_new_backup_directory_is_created_with_mode_0700(
+    tmp_path: Path, permissive_umask, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+
+    backup_instance(instance, output, execute=True)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert capsys.readouterr().err == ""
+
+
+def test_open_existing_backup_directory_is_kept_and_warned_about(
+    tmp_path: Path, permissive_umask, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    output.mkdir(mode=0o755)
+
+    archive = backup_instance(instance, output, execute=True)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o755
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    err = capsys.readouterr().err
+    assert err == (
+        f"Warning: backup directory {output} is accessible by group or others; "
+        "Clawake leaves its mode unchanged.\n"
+    )
+
+
+def test_private_existing_backup_directory_gives_no_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    output.mkdir(mode=0o700)
+
+    backup_instance(instance, output, execute=True)
+
+    assert capsys.readouterr().err == ""
+
+
+def test_runtime_backup_preview_creates_no_directory(tmp_path: Path) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "nested" / "backups"
+
+    archive = backup_instance(instance, output, execute=False, now=_fixed_clock(_SAME_SECOND[0]))
+
+    assert archive == output / "one-20261020T093015.000001Z.tar.gz"
+    assert not (tmp_path / "nested").exists()
+
+
+def test_failure_while_writing_the_archive_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+
+    def broken_addfile(self, tarinfo, fileobj=None):
+        raise tarfile.TarError("synthetic write failure")
+
+    monkeypatch.setattr(tarfile.TarFile, "addfile", broken_addfile)
+
+    with pytest.raises(tarfile.TarError, match="synthetic write failure"):
+        backup_instance(instance, output, execute=True)
+
+    assert list(output.iterdir()) == []

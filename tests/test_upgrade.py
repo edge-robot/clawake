@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import stat
 from datetime import UTC, datetime
@@ -389,3 +390,18 @@ def test_config_backup_is_private(tmp_path: Path) -> None:
 
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
     assert re.fullmatch(r"team-\d{8}T\d{6}\.\d{6}Z\.yml", backup.name)
+
+
+def test_backup_config_creates_a_new_backup_directory_with_mode_0700(tmp_path: Path) -> None:
+    # #34: the inventory copy is often the first file written to .backups/.
+    config = tmp_path / "team.json"
+    config.write_text('{"version": 1}\n', encoding="utf-8")
+    output = tmp_path / "backups"
+    previous = os.umask(0o022)
+    try:
+        backup = backup_config(config, output)
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
