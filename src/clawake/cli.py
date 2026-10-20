@@ -1342,9 +1342,12 @@ def onshape_mcp(
     execute: ExecuteFlag = False,
 ) -> None:
     """Operate the isolated external-token MCP service; never handle OAuth tokens."""
+    from clawake.services import onshape_mcp as mcp
     from clawake.services.onshape_mcp import (
+        McpHealthError,
         OnshapeMcpSpec,
         plan_onshape_mcp,
+        preflight_health_command,
         probe_native,
         validate_runtime_paths,
     )
@@ -1372,6 +1375,13 @@ def onshape_mcp(
         if result.return_code:
             raise typer.Exit(1)
         return
+    probes = mcp.default_mcp_probes()
+    # #39: refuse an image that cannot run its health check, before anything is written.
+    try:
+        preflight_health_command(spec, probes)
+    except McpHealthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     changes = plan_onshape_mcp(spec)
     for change in changes:
         typer.echo(f"{change.member}: {change.destination}")

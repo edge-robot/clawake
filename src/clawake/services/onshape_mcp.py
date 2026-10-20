@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import Field, field_validator, model_validator
 
 from clawake.config import BaseModel, HostPath, NetworkSpec, ResourceName, ServiceImageSpec
 from clawake.services.deployment import ArtifactChange
+from clawake.services.readiness import run_command
 from clawake.services.render import render_shared_network
+from clawake.services.systemd import CommandResult
 
 # The health check rendered before #39. Without a `health` block the quadlet stays byte-identical.
 DEFAULT_HEALTH_COMMAND = ["curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
@@ -147,6 +152,70 @@ CPUQuota={spec.cpu_quota_percent}%
 WantedBy=default.target
 """
     return {f"{spec.network}.network": network, f"{spec.name}.container": container}
+
+
+class McpHealthError(ValueError):
+    """A fail-closed health preflight or health wait result; the message is operator-ready."""
+
+
+@dataclass(frozen=True)
+class McpProbes:
+    """Injectable seams for every podman/systemctl call of the MCP health lifecycle."""
+
+    run: Callable[[list[str], float], CommandResult]
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+
+
+def default_mcp_probes() -> McpProbes:
+    return McpProbes(run=run_command)
+
+
+PREFLIGHT_TIMEOUT_SECONDS = 60.0
+# podman run: 125 is a Podman error, 126/127 mean the contained command cannot be invoked or
+# found. Every other exit code comes from the executable itself, so it exists.
+_PODMAN_ERROR = 125
+_COMMAND_NOT_RUNNABLE = frozenset({126, 127})
+
+
+def preflight_command(spec: OnshapeMcpSpec, executable: str) -> list[str]:
+    """Read-only check that the image can execute `executable`: no volumes, no network."""
+    return [
+        "podman",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network=none",
+        "--entrypoint",
+        executable,
+        image_reference(spec),
+        "--help",
+    ]
+
+
+def preflight_health_command(spec: OnshapeMcpSpec, probes: McpProbes) -> None:
+    """Fail closed unless the pinned image can run every executable of the health check."""
+    image = image_reference(spec)
+    for executable in spec.health.preflight_executables():
+        result = probes.run(preflight_command(spec, executable), PREFLIGHT_TIMEOUT_SECONDS)
+        # run_command reports a missing podman binary as 127 with the exception class name.
+        if result.return_code == 127 and result.stderr == "FileNotFoundError":
+            raise McpHealthError("Onshape MCP preflight failed: podman is not available")
+        if result.return_code == 124 and result.stderr == "timeout":
+            raise McpHealthError(
+                f"Onshape MCP preflight for image {image} and health command {executable} "
+                f"timed out after {PREFLIGHT_TIMEOUT_SECONDS:g}s"
+            )
+        if result.return_code in _COMMAND_NOT_RUNNABLE:
+            raise McpHealthError(
+                f"Onshape MCP image {image} cannot run health command {executable}: "
+                f"executable missing or not runnable (podman exit {result.return_code})"
+            )
+        if result.return_code == _PODMAN_ERROR:
+            raise McpHealthError(
+                f"Onshape MCP preflight could not run image {image} for health command "
+                f"{executable}: podman exit {_PODMAN_ERROR} (the image must be in local storage)"
+            )
 
 
 def plan_onshape_mcp(spec: OnshapeMcpSpec) -> list[ArtifactChange]:
