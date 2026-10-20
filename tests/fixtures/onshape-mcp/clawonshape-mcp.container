@@ -1,0 +1,37 @@
+[Quadlet]
+DefaultDependencies=false
+
+[Unit]
+Description=Clawake external-token read-only Onshape MCP
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=clawonshape-mcp
+Image=localhost/onshape-mcp:pinned@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Network=clawonshape-mcp-private.network
+NetworkAlias=clawonshape-mcp
+UserNS=keep-id:uid=1000,gid=1000
+User=1000:1000
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=all
+Volume=/srv/example-mcp/credential:/run/onshape-credentials:ro
+Volume=/srv/example-mcp/config.toml:/run/onshape-config/config.toml:ro
+Exec=--config /run/onshape-config/config.toml http
+HealthCmd=curl --fail --silent http://127.0.0.1:8080/health
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthOnFailure=kill
+PodmanArgs=--pids-limit=128 --tmpfs=/tmp:rw,noexec,nosuid,size=16m
+
+[Service]
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+MemoryMax=512M
+CPUQuota=100%
+
+[Install]
+WantedBy=default.target

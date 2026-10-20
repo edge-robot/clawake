@@ -2,13 +2,77 @@
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from clawake.config import BaseModel, HostPath, NetworkSpec, ResourceName, ServiceImageSpec
 from clawake.services.deployment import ArtifactChange
 from clawake.services.render import render_shared_network
+
+# The health check rendered before #39. Without a `health` block the quadlet stays byte-identical.
+DEFAULT_HEALTH_COMMAND = ["curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+_ABSOLUTE_EXECUTABLE = re.compile(r"/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
+_BARE_EXECUTABLE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+
+
+class OnshapeMcpHealth(BaseModel):
+    """Container health check; `command` runs without a shell (exec form)."""
+
+    command: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_HEALTH_COMMAND), min_length=1, max_length=16
+    )
+    interval_s: int = Field(default=30, ge=1, le=3600)
+    timeout_s: int = Field(default=5, ge=1, le=600)
+    retries: int = Field(default=3, ge=1, le=100)
+    start_period_s: int = Field(default=0, ge=0, le=3600)
+
+    @field_validator("command")
+    @classmethod
+    def safe_command(cls, command: list[str]) -> list[str]:
+        for argument in command:
+            # `%` and `$` would be expanded by systemd in the generated ExecStart line.
+            if not argument or not argument.isprintable() or "%" in argument or "$" in argument:
+                raise ValueError(
+                    "Health command arguments must be non-empty single-line text without '%' or '$'"
+                )
+        executable = command[0]
+        if not (
+            _ABSOLUTE_EXECUTABLE.fullmatch(executable) or _BARE_EXECUTABLE.fullmatch(executable)
+        ):
+            raise ValueError("Health command must start with an absolute path or executable name")
+        return command
+
+    @property
+    def shell_form(self) -> bool:
+        """Only the legacy default keeps Podman's shell form, for a byte-identical quadlet."""
+        return self.command == DEFAULT_HEALTH_COMMAND
+
+    def health_cmd(self) -> str:
+        if self.shell_form:
+            return " ".join(self.command)
+        # A JSON array starting with "CMD" is exec form: Podman runs it without /bin/sh.
+        return json.dumps(["CMD", *self.command], separators=(",", ":"))
+
+    def preflight_executables(self) -> list[str]:
+        """Executables the image must provide for this health check to run."""
+        if self.shell_form:
+            return ["/bin/sh", self.command[0]]
+        return [self.command[0]]
+
+    def quadlet_lines(self) -> list[str]:
+        lines = [
+            f"HealthCmd={self.health_cmd()}",
+            f"HealthInterval={self.interval_s}s",
+            f"HealthTimeout={self.timeout_s}s",
+            f"HealthRetries={self.retries}",
+        ]
+        if self.start_period_s > 0:
+            lines.append(f"HealthStartPeriod={self.start_period_s}s")
+        lines.append("HealthOnFailure=kill")
+        return lines
 
 
 class OnshapeMcpSpec(BaseModel):
@@ -21,6 +85,7 @@ class OnshapeMcpSpec(BaseModel):
     quadlet_root: HostPath
     memory_mb: int = Field(default=512, ge=128, le=4096)
     cpu_quota_percent: int = Field(default=100, ge=10, le=400)
+    health: OnshapeMcpHealth = Field(default_factory=OnshapeMcpHealth)
 
     @model_validator(mode="after")
     def pinned(self) -> OnshapeMcpSpec:
@@ -36,8 +101,13 @@ class OnshapeMcpSpec(BaseModel):
         return self
 
 
+def image_reference(spec: OnshapeMcpSpec) -> str:
+    return f"{spec.image.repository}:{spec.image.tag}@{spec.image.digest}"
+
+
 def render_onshape_mcp(spec: OnshapeMcpSpec) -> dict[str, str]:
-    image = f"{spec.image.repository}:{spec.image.tag}@{spec.image.digest}"
+    image = image_reference(spec)
+    health = "\n".join(spec.health.quadlet_lines())
     network = render_shared_network(
         NetworkSpec(name=spec.network, host="local", quadlet_default_dependencies=False)
     )
@@ -63,11 +133,7 @@ DropCapability=all
 Volume={spec.credential_directory}:/run/onshape-credentials:ro
 Volume={spec.config_file}:/run/onshape-config/config.toml:ro
 Exec=--config /run/onshape-config/config.toml http
-HealthCmd=curl --fail --silent http://127.0.0.1:8080/health
-HealthInterval=30s
-HealthTimeout=5s
-HealthRetries=3
-HealthOnFailure=kill
+{health}
 PodmanArgs=--pids-limit=128 --tmpfs=/tmp:rw,noexec,nosuid,size=16m
 
 [Service]
