@@ -15,7 +15,7 @@ from clawake.config import BaseModel, HostPath, NetworkSpec, ResourceName, Servi
 from clawake.services.deployment import ArtifactChange
 from clawake.services.readiness import run_command
 from clawake.services.render import render_shared_network
-from clawake.services.systemd import CommandResult
+from clawake.services.systemd import CommandResult, SystemdService
 
 # The health check rendered before #39. Without a `health` block the quadlet stays byte-identical.
 DEFAULT_HEALTH_COMMAND = ["curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
@@ -216,6 +216,104 @@ def preflight_health_command(spec: OnshapeMcpSpec, probes: McpProbes) -> None:
                 f"Onshape MCP preflight could not run image {image} for health command "
                 f"{executable}: podman exit {_PODMAN_ERROR} (the image must be in local storage)"
             )
+
+
+HEALTH_POLL_SECONDS = 2.0
+HEALTH_PROBE_TIMEOUT_SECONDS = 10.0
+HEALTH_WAIT_MARGIN_SECONDS = 30
+_HEALTH_STATUS = re.compile(r"[a-z]{1,32}")
+
+
+def health_wait_window(spec: OnshapeMcpSpec) -> int:
+    """Bounded post-apply wait: start period, every allowed failed probe plus one, 30 s margin."""
+    health = spec.health
+    return (
+        health.start_period_s
+        + health.interval_s * (health.retries + 1)
+        + (HEALTH_WAIT_MARGIN_SECONDS)
+    )
+
+
+def health_status_command(spec: OnshapeMcpSpec) -> list[str]:
+    return ["podman", "inspect", "--format", "{{.State.Health.Status}}", spec.name]
+
+
+def restart_count_command(spec: OnshapeMcpSpec) -> list[str]:
+    unit = SystemdService.unit_name(spec.name)
+    return ["systemctl", "--user", "show", "--property=NRestarts", "--value", unit]
+
+
+def read_health_status(spec: OnshapeMcpSpec, probes: McpProbes, timeout: float) -> str:
+    """The Podman health state, or ``unknown``; never echoes free text."""
+    result = probes.run(health_status_command(spec), timeout)
+    value = result.stdout.strip()
+    if result.return_code or not _HEALTH_STATUS.fullmatch(value):
+        return "unknown"
+    return value
+
+
+def read_restart_count(spec: OnshapeMcpSpec, probes: McpProbes, timeout: float) -> int | None:
+    """systemd's automatic restart counter of the unit, or ``None`` when unreadable."""
+    result = probes.run(restart_count_command(spec), timeout)
+    value = result.stdout.strip()
+    if result.return_code or not value.isdigit():
+        return None
+    return int(value)
+
+
+@dataclass(frozen=True)
+class McpHealthOutcome:
+    healthy: bool
+    state: str
+    restarts: int | None
+    elapsed: float
+
+    def message(self) -> str:
+        if self.healthy:
+            return (
+                f"Onshape MCP service healthy after {round(self.elapsed)}s; "
+                "credential readiness unverified"
+            )
+        restarts = "+?" if self.restarts is None else f"{self.restarts:+d}"
+        return f"Onshape MCP service not healthy: {self.state}, restarts {restarts}"
+
+
+def wait_healthy(spec: OnshapeMcpSpec, probes: McpProbes) -> McpHealthOutcome:
+    """Poll until ``healthy`` without new restarts, ``unhealthy``, a restart, or the window ends.
+
+    Read-only and bounded by `health_wait_window`; every probe has its own timeout. Nothing is
+    stopped or rolled back here: the operator decides what to do with a failure.
+    """
+    window = health_wait_window(spec)
+    start = probes.clock()
+    deadline = start + window
+
+    def probe_timeout() -> float:
+        return max(1.0, min(HEALTH_PROBE_TIMEOUT_SECONDS, deadline - probes.clock()))
+
+    baseline = read_restart_count(spec, probes, probe_timeout())
+    if baseline is None:
+        return McpHealthOutcome(False, "restart count unavailable", None, 0.0)
+    while True:
+        state = read_health_status(spec, probes, probe_timeout())
+        count = read_restart_count(spec, probes, probe_timeout())
+        elapsed = probes.clock() - start
+        if count is None:
+            return McpHealthOutcome(False, "restart count unavailable", None, elapsed)
+        restarts = count - baseline
+        # A changed counter means systemd restarted the service during the wait (#39).
+        if restarts != 0:
+            return McpHealthOutcome(False, state, restarts, elapsed)
+        if state == "healthy":
+            return McpHealthOutcome(True, state, restarts, elapsed)
+        if state == "unhealthy":
+            return McpHealthOutcome(False, state, restarts, elapsed)
+        remaining = deadline - probes.clock()
+        if remaining <= 0:
+            return McpHealthOutcome(
+                False, f"timeout after {window}s (last state {state})", restarts, elapsed
+            )
+        probes.sleep(min(HEALTH_POLL_SECONDS, remaining))
 
 
 def plan_onshape_mcp(spec: OnshapeMcpSpec) -> list[ArtifactChange]:

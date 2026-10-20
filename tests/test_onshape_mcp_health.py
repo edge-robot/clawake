@@ -349,3 +349,194 @@ def test_help_exit_code_of_the_command_itself_counts_as_present(
     result = _invoke(monkeypatch, host, FakeSystemd(), "-c", str(path), "--action", "plan")
 
     assert result.exit_code == 0, result.output
+
+
+# --- post-apply health wait ---------------------------------------------------------------------
+
+
+def _apply(monkeypatch, host, systemd, path):
+    return _invoke(monkeypatch, host, systemd, "-c", str(path), "--action", "apply", "--execute")
+
+
+def test_apply_waits_until_healthy(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost(health=["starting", "starting", "healthy"], restarts=["0"])
+    systemd = FakeSystemd()
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _apply(monkeypatch, host, systemd, path)
+
+    assert result.exit_code == 0, result.output
+    assert [verb for verb, _name, _execute in systemd.calls] == ["daemon-reload", "restart"]
+    assert _quadlet_files(tmp_path) == [
+        "clawonshape-mcp-private.network",
+        "clawonshape-mcp.container",
+    ]
+    assert "Waiting up to 150s for Onshape MCP health" in result.output
+    assert "Onshape MCP service healthy after 4s; credential readiness unverified" in result.output
+    assert "configured and started" not in result.output
+    inspect = [call for call in host.calls if call[:2] == ["podman", "inspect"]]
+    assert inspect[0] == [
+        "podman",
+        "inspect",
+        "--format",
+        "{{.State.Health.Status}}",
+        "clawonshape-mcp",
+    ]
+    show = [call for call in host.calls if call[:3] == ["systemctl", "--user", "show"]]
+    assert show[0] == [
+        "systemctl",
+        "--user",
+        "show",
+        "--property=NRestarts",
+        "--value",
+        "clawonshape-mcp.service",
+    ]
+
+
+def test_apply_reports_unhealthy(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost(health=["starting", "unhealthy"], restarts=["0"])
+    systemd = FakeSystemd()
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _apply(monkeypatch, host, systemd, path)
+
+    assert result.exit_code == 1, result.output
+    assert result.output.strip().splitlines()[-1] == (
+        "Onshape MCP service not healthy: unhealthy, restarts +0"
+    )
+    # No automatic rollback: nothing is stopped or rewritten after the failure.
+    assert [verb for verb, _name, _execute in systemd.calls] == ["daemon-reload", "restart"]
+
+
+def test_apply_reports_growing_restarts_even_when_healthy(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The live failure: killed and restarted, healthy in between.
+    host = FakeMcpHost(health=["healthy"], restarts=["4", "6"])
+    path = service_file()
+
+    result = _apply(monkeypatch, host, FakeSystemd(), path)
+
+    assert result.exit_code == 1, result.output
+    assert result.output.strip().splitlines()[-1] == (
+        "Onshape MCP service not healthy: healthy, restarts +2"
+    )
+
+
+def test_apply_reports_timeout(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost(health=["starting"], restarts=["0"])
+    path = service_file(command=BINARY_COMMAND, interval_s=10, retries=2, start_period_s=5)
+
+    result = _apply(monkeypatch, host, FakeSystemd(), path)
+
+    assert result.exit_code == 1, result.output
+    assert "Waiting up to 65s for Onshape MCP health" in result.output
+    assert result.output.strip().splitlines()[-1] == (
+        "Onshape MCP service not healthy: timeout after 65s (last state starting), restarts +0"
+    )
+    assert host.now == pytest.approx(65.0)
+
+
+def test_apply_fails_closed_when_the_restart_count_is_unreadable(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost(health=["healthy"], restarts=["[not set]"])
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _apply(monkeypatch, host, FakeSystemd(), path)
+
+    assert result.exit_code == 1, result.output
+    assert result.output.strip().splitlines()[-1] == (
+        "Onshape MCP service not healthy: restart count unavailable, restarts +?"
+    )
+
+
+def test_apply_tolerates_a_container_that_is_not_there_yet(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost(health=["<missing>", "starting", "healthy"], restarts=["0"])
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _apply(monkeypatch, host, FakeSystemd(), path)
+
+    assert result.exit_code == 0, result.output
+
+
+def test_apply_preview_writes_nothing_and_waits_for_nothing(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost()
+    systemd = FakeSystemd()
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _invoke(monkeypatch, host, systemd, "-c", str(path), "--action", "apply")
+
+    assert result.exit_code == 0, result.output
+    assert len(host.podman_runs()) == 1
+    assert host.calls == host.podman_runs()
+    assert systemd.calls == []
+    assert _quadlet_files(tmp_path) == []
+
+
+# --- status -------------------------------------------------------------------------------------
+
+
+def test_status_prints_health_and_restarts(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost(health=["healthy"], restarts=["3"])
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _invoke(
+        monkeypatch, host, FakeSystemd(), "-c", str(path), "--action", "status", "--execute"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "health: healthy" in result.output
+    assert "restarts: 3" in result.output
+    assert host.podman_runs() == []
+
+
+def test_status_preview_runs_nothing(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost()
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _invoke(monkeypatch, host, FakeSystemd(), "-c", str(path), "--action", "status")
+
+    assert result.exit_code == 0, result.output
+    assert host.calls == []
+    assert "podman inspect --format {{.State.Health.Status}} clawonshape-mcp" in result.output
+    assert (
+        "systemctl --user show --property=NRestarts --value clawonshape-mcp.service"
+        in result.output
+    )
+
+
+def test_status_of_a_failed_unit_still_shows_health_and_exits_1(
+    tmp_path: Path, service_file, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = FakeMcpHost(health=["unhealthy"], restarts=["97"])
+    path = service_file(command=BINARY_COMMAND)
+
+    result = _invoke(
+        monkeypatch,
+        host,
+        FakeSystemd(status_code=3),
+        "-c",
+        str(path),
+        "--action",
+        "status",
+        "--execute",
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "health: unhealthy" in result.output
+    assert "restarts: 97" in result.output
