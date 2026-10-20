@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import tarfile
 import warnings
 from pathlib import Path
 from typing import Annotated, Literal
@@ -859,7 +860,8 @@ def setup_quadlets(
             continue
         try:
             archive = backup_instance(instance, BACKUP_DIR, execute=True)
-        except OSError as exc:
+        except (OSError, tarfile.TarError) as exc:
+            # Like rollout: a failed backup aborts before any write (explicit error, exit 1).
             typer.echo(
                 f"Backup before adopting {', '.join(adoptions[instance.name])} for "
                 f"{instance.name} failed: {exc}. Nothing was changed.",
