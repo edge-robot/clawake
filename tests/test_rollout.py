@@ -377,7 +377,7 @@ def test_readiness_failure_after_restart_stops_without_commit(team: Team) -> Non
     assert team.host.installs() == []
     out = result.output
     assert "The deployed state of alpha now differs from the committed runtime pins." in out
-    assert re.search(r"Backups: .*\.backups/alpha-\d{8}T\d{6}Z\.tar\.gz", out)
+    assert re.search(r"Backups: .*\.backups/alpha-\d{8}T\d{6}\.\d{6}Z\.tar\.gz", out)
     assert f"clawake rollout -c {team.cfg} -m alpha --execute" in out
     rows = _summary(out)
     assert rows["alpha"][6:8] == ["failed", "failed"]

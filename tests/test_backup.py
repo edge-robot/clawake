@@ -1,5 +1,8 @@
 import tarfile
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from clawake.config import BackupPolicy, DashboardMeta, ImageSpec, InstanceSpec
 from clawake.services.backup import backup_instance, prune_backups
@@ -102,3 +105,54 @@ def test_prune_backups_retains_newest_matching_files(tmp_path: Path) -> None:
     assert not paths[0].exists()
     assert paths[1].exists()
     assert paths[2].exists()
+
+
+# --- #29: runtime archives never overwrite each other -----------------------------------------
+
+
+def _fixed_clock(*moments: datetime):
+    remaining = list(moments)
+
+    def now() -> datetime:
+        return remaining.pop(0)
+
+    return now
+
+
+_SAME_SECOND = (
+    datetime(2026, 10, 20, 9, 30, 15, 1, tzinfo=UTC),
+    datetime(2026, 10, 20, 9, 30, 15, 2, tzinfo=UTC),
+)
+
+
+def _small_instance(tmp_path: Path) -> InstanceSpec:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.txt").write_text("workspace data\n", encoding="utf-8")
+    return _instance_with_paths(workspace, tmp_path / "team")
+
+
+def test_two_runtime_backups_in_the_same_second_produce_two_archives(tmp_path: Path) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    clock = _fixed_clock(*_SAME_SECOND)
+
+    first = backup_instance(instance, output, execute=True, now=clock)
+    second = backup_instance(instance, output, execute=True, now=clock)
+
+    assert first.name == "one-20261020T093015.000001Z.tar.gz"
+    assert second.name == "one-20261020T093015.000002Z.tar.gz"
+    assert sorted(path.name for path in output.iterdir()) == [first.name, second.name]
+
+
+def test_runtime_backup_fails_closed_when_the_archive_exists(tmp_path: Path) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    output.mkdir()
+    existing = output / "one-20261020T093015.000001Z.tar.gz"
+    existing.write_bytes(b"earlier archive")
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        backup_instance(instance, output, execute=True, now=_fixed_clock(_SAME_SECOND[0]))
+
+    assert existing.read_bytes() == b"earlier archive"

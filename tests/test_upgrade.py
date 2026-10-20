@@ -1,4 +1,7 @@
 import json
+import re
+import stat
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -327,3 +330,62 @@ def test_flow_style_yaml_upgrade_output_is_unchanged(tmp_path: Path) -> None:
         "    labels: {a: b}\n"
     )
     assert config.stat().st_mode & 0o777 == 0o640
+
+
+# --- #29: config backups never overwrite each other -------------------------------------------
+
+
+def _fixed_clock(*moments: datetime):
+    remaining = list(moments)
+
+    def now() -> datetime:
+        return remaining.pop(0)
+
+    return now
+
+
+_SAME_SECOND = (
+    datetime(2026, 10, 20, 9, 30, 15, 1, tzinfo=UTC),
+    datetime(2026, 10, 20, 9, 30, 15, 2, tzinfo=UTC),
+)
+
+
+def test_two_config_backups_in_the_same_second_produce_two_files(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text("version: 1\n", encoding="utf-8")
+    output = tmp_path / "backups"
+    clock = _fixed_clock(*_SAME_SECOND)
+
+    first = backup_config(config, output, now=clock)
+    config.write_text("version: 1\n# second\n", encoding="utf-8")
+    second = backup_config(config, output, now=clock)
+
+    assert first.name == "team-20261020T093015.000001Z.yml"
+    assert second.name == "team-20261020T093015.000002Z.yml"
+    assert first.read_text(encoding="utf-8") == "version: 1\n"
+    assert second.read_text(encoding="utf-8") == "version: 1\n# second\n"
+
+
+def test_config_backup_fails_closed_when_the_target_exists(tmp_path: Path) -> None:
+    config = tmp_path / "team.json"
+    config.write_text('{"version": 1}\n', encoding="utf-8")
+    output = tmp_path / "backups"
+    output.mkdir()
+    existing = output / "team-20261020T093015.000001Z.json"
+    existing.write_text("earlier backup\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        backup_config(config, output, now=_fixed_clock(_SAME_SECOND[0]))
+
+    assert existing.read_text(encoding="utf-8") == "earlier backup\n"
+
+
+def test_config_backup_is_private(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text("version: 1\n", encoding="utf-8")
+    config.chmod(0o644)
+
+    backup = backup_config(config, tmp_path / "backups")
+
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert re.fullmatch(r"team-\d{8}T\d{6}\.\d{6}Z\.yml", backup.name)
