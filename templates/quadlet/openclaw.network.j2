@@ -1,3 +1,8 @@
+{% if not instance.quadlet_default_dependencies %}
+[Quadlet]
+DefaultDependencies=false
+
+{% endif %}
 [Unit]
 Description=OpenClaw network {{ instance.name }}
 

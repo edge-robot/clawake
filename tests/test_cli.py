@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,12 @@ from clawake.cli import app
 from clawake.services.systemd import CommandResult
 
 runner = CliRunner()
+_ACTIVE = "Active: active (running) since Mon 2026-10-19 10:00:00 UTC; 1min ago"
+
+
+def _plain_output(text: str) -> str:
+    """Keep error assertions independent of CI-forced ANSI styling."""
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
 
 
 def _write_inventory(
@@ -164,7 +171,7 @@ def test_upgrade_rejects_unpinned_new_tag(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 2
-    assert "immutable --digest is required" in result.output
+    assert "immutable --digest is required" in _plain_output(result.output)
 
 
 def test_upgrade_execute_runs_backup_migration_and_health_checks(
@@ -187,6 +194,9 @@ def test_upgrade_execute_runs_backup_migration_and_health_checks(
             self.calls.append("restart")
             return CommandResult(["systemctl", "restart"], 0, "", "")
 
+        def status(self, instance_name: str, execute: bool = False) -> CommandResult:
+            return CommandResult(["systemctl", "status"], 0, _ACTIVE, "")
+
         def unit_name(self, instance_name: str) -> str:
             return f"{instance_name}.service"
 
@@ -199,7 +209,7 @@ def test_upgrade_execute_runs_backup_migration_and_health_checks(
         "run_doctor",
         lambda instance, image: SimpleNamespace(returncode=0, stdout="ok", stderr=""),
     )
-    monkeypatch.setattr(cli, "wait_for_health", lambda instance: (True, "health-url"))
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
     monkeypatch.setattr(
         cli,
         "verify_runtime",
@@ -266,13 +276,17 @@ def test_setup_quadlets_execute_deploys_files(monkeypatch: object, tmp_path: Pat
                 "",
             )
 
+        def status(self, instance_name: str, execute: bool = False) -> CommandResult:
+            return CommandResult(["systemctl", "status"], 0, _ACTIVE, "")
+
     quadlet_root = tmp_path / "quadlets"
     cfg, _env_file, _workspace = _write_inventory(tmp_path, quadlet_root=quadlet_root)
     monkeypatch.setattr(cli, "SystemdService", RecordingSystemdService)
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
 
     result = runner.invoke(app, ["setup-quadlets", "--config", str(cfg), "--execute"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert (quadlet_root / "one.container").is_file()
     assert (quadlet_root / "one.network").is_file()
     assert (quadlet_root / "one-state.volume").is_file()
@@ -286,7 +300,6 @@ def test_setup_quadlets_execute_deploys_files(monkeypatch: object, tmp_path: Pat
             "http://127.0.0.1:18789",
             "http://localhost:18789",
         ],
-        "allowInsecureAuth": True,
     }
     assert RecordingSystemdService.daemon_reload_calls == 1
     assert RecordingSystemdService.restart_calls == 1
@@ -298,31 +311,46 @@ def test_setup_quadlets_execute_starts_unchanged_service(
     from clawake import cli
 
     class RecordingSystemdService:
-        restart_calls = 0
+        calls: list[str] = []
+        active = False
 
         def daemon_reload(self, execute: bool = False) -> CommandResult:
             return CommandResult(["systemctl", "--user", "daemon-reload"], 0, "ok", "")
 
         def restart(self, instance_name: str, execute: bool = False) -> CommandResult:
-            RecordingSystemdService.restart_calls += 1
-            return CommandResult(
-                ["systemctl", "--user", "restart", f"{instance_name}.service"],
-                0,
-                "ok",
-                "",
-            )
+            RecordingSystemdService.calls.append("restart")
+            RecordingSystemdService.active = True
+            return CommandResult(["systemctl", "--user", "restart", "one.service"], 0, "", "")
+
+        def start(self, instance_name: str, execute: bool = False) -> CommandResult:
+            RecordingSystemdService.calls.append("start")
+            RecordingSystemdService.active = True
+            return CommandResult(["systemctl", "--user", "start", "one.service"], 0, "", "")
+
+        def status(self, instance_name: str, execute: bool = False) -> CommandResult:
+            if RecordingSystemdService.active:
+                return CommandResult(["systemctl", "status"], 0, _ACTIVE, "")
+            return CommandResult(["systemctl", "status"], 3, "Active: inactive (dead)", "")
 
     quadlet_root = tmp_path / "quadlets"
     cfg, _env_file, _workspace = _write_inventory(tmp_path, quadlet_root=quadlet_root)
     monkeypatch.setattr(cli, "SystemdService", RecordingSystemdService)
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
 
     first = runner.invoke(app, ["setup-quadlets", "--config", str(cfg), "--execute"])
+    # The unit stopped in between (e.g. after a reboot); the rendering is unchanged.
+    RecordingSystemdService.active = False
     second = runner.invoke(app, ["setup-quadlets", "--config", str(cfg), "--execute"])
+    third = runner.invoke(app, ["setup-quadlets", "--config", str(cfg), "--execute"])
 
-    assert first.exit_code == 0
-    assert second.exit_code == 0
-    assert "ensuring selected services are running" in second.output
-    assert RecordingSystemdService.restart_calls == 2
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert third.exit_code == 0, third.output
+    assert "starting only inactive members" in second.output
+    assert " - one: start (unchanged, unit_inactive)" in second.output
+    assert " - one: none (unchanged, unit_active)" in third.output
+    # #5 problem 1 stays fixed (inactive → start), C1 is fixed (active → untouched).
+    assert RecordingSystemdService.calls == ["restart", "start"]
 
 
 def test_setup_quadlets_retires_legacy_service_before_restart(
@@ -353,12 +381,16 @@ def test_setup_quadlets_retires_legacy_service_before_restart(
             self.calls.append(("restart", instance_name))
             return CommandResult(["systemctl", "restart"], 0, "", "")
 
+        def status(self, instance_name: str, execute: bool = False) -> CommandResult:
+            return CommandResult(["systemctl", "status"], 0, _ACTIVE, "")
+
     cfg, _env_file, _workspace = _write_inventory(
         tmp_path,
         quadlet_root=tmp_path / "quadlets",
         legacy_names=["old-one"],
     )
     monkeypatch.setattr(cli, "SystemdService", RecordingSystemdService)
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
 
     result = runner.invoke(app, ["setup", "--config", str(cfg), "--execute"])
 
@@ -431,6 +463,24 @@ def test_restart_quadlets_execute_propagates_failures(monkeypatch: object, tmp_p
     assert result.exit_code == 1
 
 
+def _fake_readiness_seams(monkeypatch: object, *, readyz_status: int) -> None:
+    """Keep status tests off the network: /readyz and podman exec are fakes."""
+    from clawake import cli
+    from clawake.services.readiness import HttpOutcome, ReadinessProbes
+
+    def probes(service: object) -> ReadinessProbes:
+        def run(argv: list[str], timeout: float) -> CommandResult:
+            raise AssertionError(f"unexpected probe command {argv}")
+
+        return ReadinessProbes(
+            unit_status=lambda name: service.status(name, execute=True),
+            run=run,
+            http_get=lambda url, timeout: HttpOutcome(status=readyz_status),
+        )
+
+    monkeypatch.setattr(cli, "default_probes", probes)
+
+
 def test_status_quadlets_json_healthy(monkeypatch: object, tmp_path: Path) -> None:
     from clawake import cli
 
@@ -453,12 +503,14 @@ def test_status_quadlets_json_healthy(monkeypatch: object, tmp_path: Path) -> No
 
     cfg, _env_file, _workspace = _write_inventory(tmp_path)
     monkeypatch.setattr(cli, "SystemdService", HealthySystemdService)
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
 
     result = runner.invoke(app, ["status-quadlets", "--config", str(cfg), "--format", "json"])
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["instances"][0]["state"] == "healthy"
+    assert payload["instances"][0]["readiness"] == "ready"
     assert payload["instances"][0]["unit"] == "one.service"
 
 
@@ -484,11 +536,12 @@ def test_status_quadlets_text_prints_diagnostic_cause(monkeypatch: object, tmp_p
 
     cfg, _env_file, _workspace = _write_inventory(tmp_path)
     monkeypatch.setattr(cli, "SystemdService", FailedSystemdService)
+    _fake_readiness_seams(monkeypatch, readyz_status=200)
 
     result = runner.invoke(app, ["status-quadlets", "--config", str(cfg), "--format", "text"])
 
     assert result.exit_code == 1
-    assert "state=failed rc=3" in result.output
+    assert "state=failed rc=3 readiness=failed" in result.output
     assert "cause: EnvironmentFile missing" in result.output
 
 
@@ -520,7 +573,7 @@ def test_invalid_yaml_reports_config_error(tmp_path: Path) -> None:
     result = runner.invoke(app, ["validate", "-c", str(config)])
     assert result.exit_code == 2
     assert "Cannot load" in result.output
-    assert "--config" in result.output
+    assert "--config" in _plain_output(result.output)
 
 
 def test_unknown_member_lists_available_members(tmp_path: Path) -> None:

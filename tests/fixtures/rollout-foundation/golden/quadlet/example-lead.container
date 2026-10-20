@@ -1,0 +1,30 @@
+[Quadlet]
+DefaultDependencies=false
+
+[Unit]
+Description=OpenClaw instance example-lead
+
+[Container]
+ContainerName=example-lead
+Image=ghcr.io/example/openclaw:2026.1.1@sha256:1111111111111111111111111111111111111111111111111111111111111111
+UserNS=keep-id:uid=1000,gid=1000
+EnvironmentFile=/srv/example/env/lead.env
+Volume=/srv/example/lead/workspace:/workspace
+Volume=/srv/example/roles/lead:/team-definition:ro
+Volume=/srv/example/lead/state:/home/node/.openclaw
+Network=example-team.network
+NetworkAlias=example-lead
+Volume=/srv/example/shared/briefs:/mnt/briefs:ro
+Volume=/srv/example/shared/keys:/mnt/keys:ro
+Volume=/srv/example/packages/example-cad-0.0.1.tgz:/opt/clawake/plugins/example-cad.tgz:ro
+PublishPort=127.0.0.1:19001:18789/tcp
+Exec=openclaw gateway run --bind lan --port 18789 --allow-unconfigured
+Label=clawake.instance=example-lead
+Label=clawake.role=product_owner
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

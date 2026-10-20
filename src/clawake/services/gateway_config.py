@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 
 from clawake.config import InstanceSpec
@@ -10,6 +12,7 @@ from clawake.config import InstanceSpec
 _LOOPBACK_ADDRESSES = {"127.0.0.1", "::1", "localhost"}
 _MANAGED_WORKSPACE = "/workspace"
 _PLUGIN_RUNTIME_STATE = "clawake-managed-plugin-runtime.json"
+_SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def _load_config(config_path: Path) -> dict[str, object]:
@@ -54,48 +57,60 @@ def local_control_ui_origins(instance: InstanceSpec) -> list[str]:
 
 def ensure_workspace_config(instance: InstanceSpec) -> tuple[Path, bool]:
     """Make the workspace mounted by Clawake OpenClaw's default agent workspace."""
-    config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
+    config_path = instance.runtime_state_path / "openclaw.json"
     payload = _load_config(config_path)
+
+    changed = configure_workspace(payload)
+    if changed:
+        _write_config(config_path, payload)
+    return config_path, changed
+
+
+def configure_workspace(payload: dict[str, object]) -> bool:
+    """Merge workspace defaults in memory for preview and application."""
 
     agents = payload.setdefault("agents", {})
     if not isinstance(agents, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': agents must be an object")
+        raise ValueError("OpenClaw config: agents must be an object")
     defaults = agents.setdefault("defaults", {})
     if not isinstance(defaults, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': agents.defaults must be an object")
+        raise ValueError("OpenClaw config: agents.defaults must be an object")
 
     if defaults.get("workspace") == _MANAGED_WORKSPACE:
-        return config_path, False
+        return False
 
     defaults["workspace"] = _MANAGED_WORKSPACE
-    _write_config(config_path, payload)
-    return config_path, True
+    return True
 
 
 def ensure_control_ui_config(instance: InstanceSpec) -> tuple[Path, bool]:
     """Merge inferred local Control UI settings into OpenClaw's persisted config."""
-    config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
+    config_path = instance.runtime_state_path / "openclaw.json"
+    payload = _load_config(config_path)
+    changed = configure_control_ui(instance, payload)
+    if changed:
+        _write_config(config_path, payload)
+    return config_path, changed
+
+
+def configure_control_ui(instance: InstanceSpec, payload: dict[str, object]) -> bool:
+    """Merge dashboard defaults without filesystem side effects."""
     origins = local_control_ui_origins(instance)
     if not instance.gateway_runtime.enabled or not origins:
-        return config_path, False
-
-    payload = _load_config(config_path)
+        return False
 
     gateway = payload.setdefault("gateway", {})
     if not isinstance(gateway, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': gateway must be an object")
+        raise ValueError("OpenClaw config: gateway must be an object")
     control_ui = gateway.setdefault("controlUi", {})
     if not isinstance(control_ui, dict):
-        raise ValueError(f"OpenClaw config '{config_path}': gateway.controlUi must be an object")
+        raise ValueError("OpenClaw config: gateway.controlUi must be an object")
 
     existing_origins = control_ui.get("allowedOrigins", [])
     if not isinstance(existing_origins, list) or not all(
         isinstance(origin, str) for origin in existing_origins
     ):
-        raise ValueError(
-            f"OpenClaw config '{config_path}': gateway.controlUi.allowedOrigins "
-            "must be a string array"
-        )
+        raise ValueError("OpenClaw config: gateway.controlUi.allowedOrigins must be a string array")
 
     changed = False
     merged_origins = list(dict.fromkeys([*existing_origins, *origins]))
@@ -103,31 +118,97 @@ def ensure_control_ui_config(instance: InstanceSpec) -> tuple[Path, bool]:
         control_ui["allowedOrigins"] = merged_origins
         changed = True
 
-    gateway_bindings = [
-        port.bind_address
-        for port in instance.ports
-        if port.protocol == "tcp"
-        and port.container_port == instance.gateway_runtime.gateway_container_port
-    ]
-    local_http_only = bool(gateway_bindings) and all(
-        address in _LOOPBACK_ADDRESSES for address in gateway_bindings
-    )
-    if local_http_only and "allowInsecureAuth" not in control_ui:
-        # OpenClaw otherwise rejects token authentication from its HTTP Control UI.
-        # This is only enabled when the published gateway is loopback-only.
-        control_ui["allowInsecureAuth"] = True
-        changed = True
+    # Do not opt users into insecure authentication. OpenClaw 2026.9.4 also
+    # rejects the former allowInsecureAuth key during configuration validation.
 
-    if not changed:
-        return config_path, False
+    return changed
 
-    _write_config(config_path, payload)
-    return config_path, True
+
+@dataclass(frozen=True)
+class InstalledPlugin:
+    """One `installedPlugins` ledger entry: the archive digest Clawake verified and installed."""
+
+    sha256: str
+    version: str | None
+
+
+@dataclass(frozen=True)
+class PluginRuntimePlan:
+    """In-memory result of merging managed plugin settings; nothing is written."""
+
+    config_path: Path
+    state_path: Path
+    payload: dict[str, object]
+    config_changed: bool
+    next_state: dict[str, object]
+    state_changed: bool
+
+
+def plugin_runtime_state_path(instance: InstanceSpec) -> Path:
+    return instance.runtime_state_path / _PLUGIN_RUNTIME_STATE
+
+
+def _installed_entries(state: dict[str, object], state_path: Path) -> dict[str, dict[str, str]]:
+    raw = state.get("installedPlugins", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"Clawake state '{state_path}': installedPlugins must be an object")
+    entries: dict[str, dict[str, str]] = {}
+    for plugin_id, entry in raw.items():
+        if (
+            not isinstance(plugin_id, str)
+            or not isinstance(entry, dict)
+            or not isinstance(entry.get("sha256"), str)
+            or not _SHA256_DIGEST.fullmatch(entry["sha256"])
+            or not isinstance(entry.get("version", ""), str)
+        ):
+            raise ValueError(f"Clawake state '{state_path}': invalid installedPlugins entry")
+        entries[plugin_id] = dict(entry)
+    return entries
+
+
+def read_installed_plugins(instance: InstanceSpec) -> dict[str, InstalledPlugin]:
+    """Read the installed-archive ledger; a missing ledger or entry means `ledger_missing`."""
+    state_path = plugin_runtime_state_path(instance)
+    entries = _installed_entries(_load_config(state_path), state_path)
+    return {
+        plugin_id: InstalledPlugin(entry["sha256"], entry.get("version") or None)
+        for plugin_id, entry in entries.items()
+    }
+
+
+def record_installed_plugin(
+    instance: InstanceSpec, plugin_id: str, sha256: str, version: str | None
+) -> Path:
+    """Record a verified archive install. Call only after the install succeeded."""
+    if not _SHA256_DIGEST.fullmatch(sha256):
+        raise ValueError(f"Refusing to record a non-sha256 digest for plugin '{plugin_id}'")
+    state_path = plugin_runtime_state_path(instance)
+    state = _load_config(state_path)
+    entries = _installed_entries(state, state_path)
+    entry = {"sha256": sha256}
+    if version:
+        entry["version"] = version
+    entries[plugin_id] = entry
+    if not state:
+        state = {"version": 1, "agentToolAllow": {}, "globalToolAllow": []}
+    state["installedPlugins"] = dict(sorted(entries.items()))
+    _write_config(state_path, state)
+    return state_path
 
 
 def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
     """Atomically merge managed plugin settings and per-agent optional-tool grants."""
-    config_path = Path(instance.workspace_path).expanduser() / ".openclaw" / "openclaw.json"
+    plan = plan_plugin_runtime_config(instance)
+    if plan.config_changed:
+        _write_config(plan.config_path, plan.payload)
+    if plan.state_changed:
+        _write_config(plan.state_path, plan.next_state)
+    return plan.config_path, plan.config_changed
+
+
+def plan_plugin_runtime_config(instance: InstanceSpec) -> PluginRuntimePlan:
+    """Compute managed plugin settings, grants and ledger without any writes."""
+    config_path = instance.runtime_state_path / "openclaw.json"
     state_path = config_path.with_name(_PLUGIN_RUNTIME_STATE)
     payload = _load_config(config_path)
     original_payload = deepcopy(payload)
@@ -171,6 +252,38 @@ def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
         if experimental.get("customPlugins") is not True:
             experimental["customPlugins"] = True
             changed = True
+
+    # Explicit operator opt-in: agent alsoAllow cannot override a global allowlist.
+    # Own only newly added names, so withdrawing a managed grant preserves names
+    # that the operator already allowed before Clawake began managing it.
+    previous_global = state.get("globalToolAllow", [])
+    if not isinstance(previous_global, list) or not all(
+        isinstance(name, str) for name in previous_global
+    ):
+        raise ValueError(f"Clawake state '{state_path}': globalToolAllow must be a string array")
+    next_global: list[str] = []
+    if instance.global_tool_allow or previous_global:
+        global_tools = payload.get("tools")
+        existing = global_tools.get("allow") if isinstance(global_tools, dict) else None
+        if instance.global_tool_allow and (
+            not isinstance(existing, list)
+            or not existing
+            or not all(isinstance(name, str) for name in existing)
+        ):
+            raise ValueError(
+                "global_tool_allow requires an existing non-empty tools.allow; "
+                "Clawake will not replace default host policy"
+            )
+        if isinstance(existing, list) and all(isinstance(name, str) for name in existing):
+            unmanaged = [name for name in existing if name not in previous_global]
+            next_global = [name for name in instance.global_tool_allow if name not in unmanaged]
+            merged = list(dict.fromkeys([*unmanaged, *instance.global_tool_allow]))
+            if not merged and existing:
+                raise ValueError(
+                    "Withdrawing global grants would empty tools.allow; "
+                    "retain an explicit operator-owned allowlist"
+                )
+            global_tools["allow"] = merged
 
     previous_grants = state.get("agentToolAllow", {})
     if not isinstance(previous_grants, dict):
@@ -231,12 +344,31 @@ def ensure_plugin_runtime_config(instance: InstanceSpec) -> tuple[Path, bool]:
             tools[key] = merged
             changed = True
 
-        next_grants[agent_id] = {"key": key, "tools": managed_tools}
+        # Own only additions made by Clawake. A pre-existing operator grant of
+        # the same name must survive when it disappears from the inventory.
+        owned_tools = [item for item in managed_tools if item not in existing]
+        next_grants[agent_id] = {"key": key, "tools": owned_tools}
 
     changed = payload != original_payload
-    if changed:
-        _write_config(config_path, payload)
-    next_state: dict[str, object] = {"version": 1, "agentToolAllow": next_grants}
-    if state != next_state:
-        _write_config(state_path, next_state)
-    return config_path, changed
+    next_state: dict[str, object] = {
+        "version": 1,
+        "agentToolAllow": next_grants,
+        "globalToolAllow": next_global,
+    }
+    # Keep install records only for archive plugins that are still declared.
+    archive_ids = {plugin.id for plugin in instance.plugins if plugin.source_type == "archive"}
+    installed = {
+        plugin_id: entry
+        for plugin_id, entry in sorted(_installed_entries(state, state_path).items())
+        if plugin_id in archive_ids
+    }
+    if installed:
+        next_state["installedPlugins"] = installed
+    return PluginRuntimePlan(
+        config_path=config_path,
+        state_path=state_path,
+        payload=payload,
+        config_changed=changed,
+        next_state=next_state,
+        state_changed=state != next_state,
+    )

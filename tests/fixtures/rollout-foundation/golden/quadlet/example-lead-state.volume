@@ -1,0 +1,15 @@
+[Quadlet]
+DefaultDependencies=false
+
+[Unit]
+Description=OpenClaw runtime state volume example-lead
+
+[Volume]
+VolumeName=example-lead-state
+Driver=local
+Options=type=none
+Options=o=bind
+Options=device=/srv/example/lead/state
+
+[Install]
+WantedBy=default.target

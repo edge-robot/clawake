@@ -1,0 +1,400 @@
+# Inventory v2: model and validation boundary
+
+Version 1 retains its established runtime behavior. Version 2 supports instances,
+services or both, deterministic combined plans, dependency-ordered setup/restart,
+persistence-safe teardown and resource status/logs. `validate` stays entirely
+offline: it does not render files, contact Podman or inspect secret values.
+
+Setup/restart previews have no side effects. `--execute` checks referenced secret
+names and declared service inputs, applies a drift-checked plan and reloads once.
+HTTP readiness comes from the container health check (the image must provide curl).
+TLS verification remains enabled; privately issued certificates need an explicit
+CA trust mount/environment configuration. A failing dependency blocks its consumers.
+
+Generic `upgrade-service --service NAME --to TAG --digest SHA256` previews a pinned
+upgrade and private backups. Writable bind paths must be in the backup policy;
+named volumes are exported. `--with-dependents` explicitly includes dependent
+resources in the maintenance plan. Execution stops them in reverse dependency
+order, backs up data, updates only the selected image mapping and reconciles the
+ordered selection. Backup failure or inventory drift halts the upgrade. No
+OpenClaw doctor or application-specific provider behavior is invoked. Backups are
+retained; deletion/retention is a separate operation.
+
+Full generic managed TLS/CA distribution, service bindings and dashboard integration
+remain separate work. Unsupported `tls` and `service_bindings` fields still fail
+rather than becoming silently ineffective settings.
+
+## Service shape
+
+```yaml
+version: 2
+cluster: {name: example, primary_host: local}
+hosts: [{name: local}]
+networks: [{name: team}]
+services:
+  - name: example-api
+    host: local
+    image: {repository: example.invalid/api, tag: "1.0.0"}
+    networks: [team]
+    command: [serve, --port, "8080"]
+    ports:
+      - {host_port: 8080, container_port: 8080}
+    env_files: [/srv/example/config/api.env]
+    mounts:
+      - {source: /srv/example/config, target: /etc/example, read_only: true}
+    volumes:
+      - {name: data, target: /var/lib/example}
+    secrets:
+      - {name: example-api-token, target: api-token}
+    health: {scheme: http, port: 8080, path: /health/ready}
+    restart_policy: on-failure
+    backup_policy: {enabled: true, pre_mutation: true, paths: [/srv/example/config]}
+    interfaces:
+      api: {url: "http://example-api:8080/api"}
+    dashboard: {friendly_name: Example API, tags: [example]}
+```
+
+The example is validation-only, uses a non-resolvable image host, and needs no
+files, secrets or running containers to validate. Image tags must be explicit;
+floating tags require a digest. Optional digests must be complete SHA-256 values.
+`command` is an argument list, not a shell command string. Secret values belong
+neither in the inventory nor in environment files.
+
+## Names, networks and dependencies
+
+- V2 resource names are lowercase DNS labels, at most 63 characters, with no
+  leading/trailing hyphen. Instance/service/network names are unique across those
+  declarations. Existing v1 naming behavior is retained.
+- An omitted network host defaults to `cluster.primary_host` in v2; v1 still
+  requires an explicit host. Both versions remain single-host.
+- Service container name and `.container` filename derive from `name`.
+- Volumes belong to a service: `name: data` in `example-api` derives
+  `example-api-data.volume` and the Podman volume name `example-api-data`.
+  The same local volume name in another service is independent.
+- Generated Quadlet paths, systemd unit names and Podman resource names are
+  checked for collisions, including existing instance artifacts and legacy units.
+- `depends_on: [other-resource]` is allowed on v2 instances and services. References
+  must identify a service or instance on the same host. Duplicates, self references,
+  unknown targets and cycles fail. Dependencies describe start ordering; they are
+  not proof of readiness. `dependency_order()` returns a deterministic topological
+  order for later lifecycle code.
+
+## Storage, secrets and validation limits
+
+- Host paths are expanded and normalized lexically without creating or resolving
+  filesystem objects. V2 bind sources support `..` after expansion; targets must
+  be absolute container paths without dot segments. Root mounts, control characters,
+  whitespace and Quadlet delimiter/specifier characters are rejected in this first
+  model. Nested targets are allowed; identical targets are not.
+- Environment files and backup paths are validated as paths without reading them.
+- Secrets reference existing Podman secret names, with an optional target basename
+  below `/run/secrets`; optional numeric uid/gid control ownership and the renderer
+  uses mode 0400. Duplicate names/targets and shadowing mounts fail. There is
+  no second top-level secret catalog and no secret value field.
+- Parsing checks secret syntax, not the host's secret store. The pure
+  `validate_secret_references(available_names)` preflight accepts a host-supplied
+  set of names and rejects missing references without inspecting values. Runtime
+  discovery uses `podman secret ls` names only during executed setup/restart.
+- Port collision checks cover instances and services together, wildcard and mapped
+  IPv6 addresses, and distinguish TCP from UDP. Unpublished internal health ports
+  are valid; reachability is a future runtime check.
+- Interfaces allow HTTP(S) URLs without credentials, query strings or fragments.
+  They declare endpoints, not automatic provider configuration.
+- Offline validation does not verify image availability, writable storage, host
+  permissions, certificate trust, HTTP readiness or actual secret existence.
+
+The validation module remains provider-neutral and imports no runtime clients.
+Tests use local fixtures and mocked side effects; the existing Quadlet-generator
+test is a dry run and starts no containers.
+
+## Focused Onshape MCP exception (2026-10-12)
+
+Independent of the generic v2 services above, `clawake onshape-mcp --config service.yml
+--action plan|apply|status|restart [--execute]` operates a narrow private rootless
+external-token service using the existing artifact/systemd lifecycle. It requires
+an image digest, private credential_directory, config_file and quadlet_root;
+it never reads or renews tokens. `InstanceSpec.onshape_mcp: true` reconciles the
+known local native server in disabled state; activation/agent invocation still
+requires its separate supported authority boundary. See Claw-Onshape's
+self-hosted-mcp-architecture.md for the exact mode and credential contract.
+
+## Operation examples
+
+```bash
+clawake setup -c team.yml --service example-api
+clawake setup -c team.yml --service example-api --execute
+clawake status -c team.yml --service example-api --format json
+clawake logs -c team.yml --service example-api -n 100
+clawake restart -c team.yml --service example-api --execute
+clawake teardown -c team.yml --service example-api --execute
+```
+
+`--member` and `--service` are mutually exclusive. Omitting both selects the whole
+team for lifecycle/status; logs require exactly one resource. Setup/restart includes
+transitive dependencies; teardown rejects dependencies used by unselected resources.
+Podman volumes and bind data survive teardown. Shared network definitions survive
+while unselected resources still use them. Services may set
+quadlet_default_dependencies: false on hosts that cannot supply user network-online;
+explicit resource ordering remains active.
+
+Status reads only selected safe Podman fields: unit state, container state,
+configured image/digest, running image ID/digest, restart count, health/readiness and
+failed dependencies. It never prints full inspect output, environment or health logs.
+Integrity-pinned plugin sync works for v2 members after their reviewed setup.
+Onboard/dashboard and the original member upgrade remain v1-only;
+service upgrades use the explicit generic command above.
+
+
+A service may set numeric `user: "UID:GID"` to match private host-bind ownership
+under keep-id. The image's USER is otherwise retained; keep-id alone does not
+replace an explicit image USER. `read_only: true` makes the image filesystem
+read-only while declared writable data mounts remain writable. Internal curl
+health probes use --noproxy to reach their own service DNS directly.
+
+## Member readiness (`readiness`, v1 members)
+
+Each instance may set an optional `readiness` block. `clawake status` and
+`status --wait` use it (ADR-003); v2 resource status is unchanged.
+
+```yaml
+instances:
+  - name: example-lead
+    # ...
+    health: {path: /readyz, timeout_seconds: 5}   # defaults
+    readiness:
+      channels: false              # default; opt-in channel lifecycle check
+      start_window_seconds: 180    # default; readiness wait bound (1..3600)
+```
+
+- `health.path` now defaults to `/readyz`. OpenClaw keeps `/readyz` red while startup
+  plugin sidecars, channels or hooks are still settling; `/healthz` is liveness only.
+  `upgrade` waits on the same path, so it is stricter than with the old `/health`
+  default. `HealthSpec` is not rendered into v1 Quadlets; `health.retries` and
+  `health.interval_seconds` no longer bound the `upgrade` wait.
+- `readiness.channels: true` adds `podman exec <container> openclaw channels status --json`
+  to the probe. It reads the gateway's recorded channel lifecycle only; Clawake never
+  passes `--probe`.
+- `readiness.start_window_seconds` bounds every readiness wait: `status --wait` (where
+  `--timeout <s>` overrides it), the per-member wait of `setup --execute` and
+  `sync-plugins --execute`, and the post-restart wait of `upgrade --execute`.
+
+States, evaluated in this order:
+
+| State | Rule |
+|---|---|
+| `stopped` | the unit is inactive, dead or not loaded |
+| `failed` | the unit failed (or waits for an automatic restart), its state is unknown, or `--wait` ran out before `ready`/`degraded` |
+| `starting` | the unit is active or activating and `GET <gateway>/readyz` is not 200, refused or timed out |
+| `degraded` | `/readyz` is 200, but a pinned plugin is missing from `openclaw plugins list --json`, not `enabled`, not `status: loaded`, or its `version` differs from the pinned package version (`package/package.json` in the archive, or the npm spec version); or, with `channels: true`, a channel account is not up; or any of these outputs could not be parsed |
+| `ready` | none of the above |
+
+A channel account is up only if `running` is `true`, `connected` is not `false`, and
+`lifecycle` is `ready` or `running` (OpenClaw 2026.9.9 reports `ready` on a healthy
+member). Otherwise the reasons are `channel_not_running`, `channel_not_connected` or
+`channel_lifecycle` (also for a missing or unknown lifecycle value).
+
+Every non-`ready` state carries snake_case `reasons` with a short sanitized detail.
+Probes are read-only: one HTTP GET from the host to the published gateway port (no
+proxy), and the `podman exec ... openclaw ... --json` commands above, each with a timeout
+of at most 10 s. Raw command output, container environment and tokens are never printed.
+OpenClaw's `plugins list --json` has no integrity field, so `degraded` compares versions,
+not sha256 digests.
+
+## Runtime pin overlay (`runtime_pins`, v1)
+
+ADR-004. A v1 inventory may move its per-rollout values into a private, Clawake-owned
+JSON file. The versioned inventory then stays unchanged across rollouts.
+
+```yaml
+version: 1
+runtime_pins: ${HOME}/.config/clawake/example-cad/pins.json   # or relative to this file
+instances:
+  - name: example-lead
+    image:
+      repository: ghcr.io/example/openclaw   # tag/digest/known_good_* come from the overlay
+    plugins:
+      - id: example-cad                       # artifact_path/sha256 come from the overlay
+        config: {liveReads: false}
+```
+
+```json
+{
+  "version": 1,
+  "cluster": "example-cad",
+  "members": {
+    "example-lead": {
+      "image": {"tag": "2026.1.1", "digest": "sha256:<64 hex>",
+                "known_good_tag": "2026.1.0", "known_good_digest": "sha256:<64 hex>"},
+      "plugins": {"example-cad": {"artifact_path": "/srv/example/packages/example-cad-0.0.1.tgz",
+                                  "sha256": "sha256:<64 hex>"}}
+    }
+  }
+}
+```
+
+- **Reference.** `runtime_pins` is a path. `${...}` is expanded like other inventory
+  values; a relative path is resolved against the inventory file's directory. The file
+  must exist; only `clawake pins init` accepts a missing file. v2 inventories reject
+  `runtime_pins`.
+- **Allowlist.** `version` (must be `1`) and `cluster` (must equal `cluster.name`) are
+  required. Per declared member, only `image.tag`, `image.digest`,
+  `image.known_good_tag`, `image.known_good_digest` and, for declared archive plugins,
+  `plugins.<id>.artifact_path` and `plugins.<id>.sha256` are allowed. Unknown keys,
+  unknown members, undeclared plugin ids, pins for npm plugins and digests that are not
+  `sha256:<64 lowercase hex>` are rejected with the file path and the key path, for
+  example `members.example-lead.image.repository: unknown key`. Overlay values are not
+  `${...}`-expanded.
+- **Merge.** The overlay is applied to the expanded inventory data before model
+  validation, so all v1 validators see the effective values. A plugin entry may omit
+  `artifact_path`/`sha256` when the overlay supplies them. A field set in both files to
+  the same value is accepted; different values fail with
+  `runtime pins conflict: instances[<member>].image.digest is '<a>' in inventory <file>
+  but '<b>' in runtime pins <file>; remove it from one of them`.
+- **File safety.** Loading refuses a group- or world-writable overlay and warns if it is
+  group- or world-readable. Clawake writes it atomically (temporary file in the same
+  directory, `fsync`, rename, mode 0600), never through a symlink, and first copies the
+  previous version to `<overlay dir>/pins-backups/<UTC timestamp>.json` (mode 0600,
+  newest 20 kept).
+- **Writers.** With `runtime_pins`, `upgrade` and rollback write the image fields to the
+  overlay and never touch the inventory file. Without it, they edit the inventory as
+  before.
+
+## Site values and `${site:<name>}` references (`site_values`, v1)
+
+ADR-005 items 1 and 2. Private site data that is not secret, for example Discord IDs, lives
+in an operator-written JSON file. The versioned inventory refers to it by name only.
+
+```yaml
+version: 1
+site_values: ${HOME}/.config/clawake/example-cad/site.json   # or relative to this file
+```
+
+```json
+{
+  "version": 1,
+  "cluster": "example-cad",
+  "values": {
+    "discord.guild": "100000000000000001",
+    "discord.lead_channel": "100000000000000002",
+    "discord.approvers": ["100000000000000003", "100000000000000004"]
+  }
+}
+```
+
+- **File.**
+  - `version` must be `1` and `cluster` must equal `cluster.name`.
+  - `values` maps names (`^[a-z0-9][a-z0-9_.-]*$`) to a string or a list of strings.
+  - Other top-level keys, other value types and invalid names are rejected. The error
+    names the file and the key path, never a value.
+  - The path is resolved like `runtime_pins`: `${...}` is expanded, and a relative path
+    is resolved against the inventory directory. A declared file that is missing is an
+    error.
+  - File safety follows the overlay rules: a group- or world-writable file is refused,
+    and a group- or world-readable one prints a warning.
+  - **Clawake never writes this file.** There is no `init` command. It never holds
+    secrets: tokens stay in member env files.
+  - v2 inventories reject `site_values`.
+- **References.** An inventory string that is exactly `${site:<name>}` is replaced by the
+  value.
+  - Order: `${VAR}` expansion first (it never looks up `site:…`), then site
+    substitution, then the runtime pin overlay, then model validation.
+  - A list value replaces the whole field, for example `users: ${site:discord.approvers}`.
+    A list in a string-only position is a model type error.
+  - Any other string that contains `${site:` is an error, so IDs are never concatenated.
+    Mapping keys cannot be references.
+  - An unknown name fails loading. A reference without a declared `site_values` also fails.
+  - Errors name the inventory path and the site value name, for example
+    `instances[example-lead].openclaw.discord.guilds[0].id: unknown site value
+    'discord.gild' (not defined in site values file <path>)`.
+  - Substitution is generic: plugin `config` may use the same references.
+- **`validate`** prints `site values: <path> (N values, M references)`. For values that
+  no reference uses it prints
+  `WARNING: site values file <path>: unused values: <name>, ...` (names only).
+
+## Discord channel (`openclaw.discord`, v1 members)
+
+ADR-005 items 3 and 4. Clawake renders the whole default-account `channels.discord`
+object of a member and owns it as one ledger field, `channels/discord`.
+
+```yaml
+openclaw:
+  discord:
+    enabled: true
+    token_env: DISCORD_BOT_TOKEN                      # env key name, never a value
+    application_id: ${site:discord.application_id}    # optional
+    dm_policy: allowlist                              # disabled (default) | allowlist | pairing
+    allow_from: ${site:discord.dm_allow}              # required iff dm_policy: allowlist
+    group_policy: allowlist                           # allowlist | disabled
+    guilds:
+      - id: ${site:discord.guild}
+        require_mention: true
+        roles: ["${site:discord.operator_role}"]      # quote references inside [ ]
+        channels:
+          - id: ${site:discord.lead_channel}
+            require_mention: true
+            users: ${site:discord.approvers}
+```
+
+| Key | Type | Default | Rule |
+|---|---|---|---|
+| `enabled` | bool | `true` | `false` renders `{"enabled": false}`; no other key is allowed |
+| `token_env` | env name `^[A-Z][A-Z0-9_]{0,127}$` (OpenClaw SecretRef id) | none | required when enabled; `setup` checks that it is a key in one of the member's `env_files` |
+| `application_id` | snowflake | unset | optional |
+| `dm_policy` | `disabled` \| `allowlist` \| `pairing` | `disabled` | `open` is not offered |
+| `allow_from` | list of snowflakes | `[]` | required and non-empty with `dm_policy: allowlist`, forbidden otherwise |
+| `group_policy` | `allowlist` \| `disabled` | `allowlist` | `open` is not offered |
+| `guilds[].id` | snowflake | none | unique across `guilds` |
+| `guilds[].require_mention` | bool | `true` | |
+| `guilds[].users`, `guilds[].roles` | list of snowflakes | `[]` | guild defaults; no duplicates |
+| `guilds[].channels[].id` | snowflake | none | unique across all guilds |
+| `guilds[].channels[].enabled` | bool | `true` | |
+| `guilds[].channels[].require_mention` | bool | unset | rendered only when set |
+| `guilds[].channels[].users`, `.roles` | list of snowflakes | `[]` | no duplicates |
+
+- **Snowflakes.** After substitution, every ID must match `^[0-9]{17,20}$` and be a YAML
+  string: quote literal IDs, and quote references inside flow lists (`["${site:x}"]`). Names, tags, `*` and `dangerouslyAllowNameMatching` are rejected, and so are
+  unknown keys such as `token`, `accounts` or `config_writes` / `configWrites`.
+- **Allowlist rule (#21).** With `group_policy: allowlist`:
+  - every enabled channel needs non-empty `users` or `roles`, either its own or its
+    guild's;
+  - a guild without `channels` needs guild `users` or `roles`, because OpenClaw then
+    allows every channel of that guild.
+- **Rendering.**
+  - OpenClaw key names: `enabled`, `token`, `applicationId`, `dmPolicy`, `allowFrom`,
+    `groupPolicy`, `configWrites`, and `guilds.<id>` with `requireMention`, `users`,
+    `roles` and `channels.<id>.{enabled,requireMention,users,roles}`.
+  - `token` is always `{"source": "env", "provider": "default", "id": <token_env>}`.
+  - `configWrites` is always `false` for an enabled member and cannot be set in the
+    inventory. OpenClaw enables channel-initiated config writes (`/config set`,
+    `/config unset` from Discord) by default; config changes go through the inventory
+    and `setup` only (ADR-005 amendment, item 8). A disabled member still renders only
+    `{"enabled": false}`.
+  - Empty lists and unset optionals are omitted.
+- **Ownership.**
+  - A member without `discord` leaves `channels.discord` untouched and unowned.
+  - An existing unowned block that differs from the rendering is taken over only with
+    `setup --adopt discord-channel` (see the manual).
+  - After that, any change made outside Clawake trips the drift guard
+    (`Managed field changed outside Clawake: channels/discord`).
+- **Preview redaction.** Changed key paths below `channels/discord` are printed with every
+  ID segment as `<id>` and an `(added)`, `(removed)` or `(changed)` marker. Values are
+  never printed.
+
+## MCP server models and the conflict rule
+
+Two inventory models provision OpenClaw's native MCP client configuration
+(`mcp.servers.<name>`); OpenClaw remains the transport and Clawake never handles
+OAuth tokens.
+
+- **Instance flags** `onshape_mcp` / `onshape_mcp_enabled` on an instance manage the
+  fixed local server `onshape` (`http://clawonshape-mcp:8080/mcp`) of the focused
+  Onshape MCP service above. `onshape_mcp_enabled` requires `onshape_mcp`. A disabled
+  hosted Onshape connector that is not yet managed is adopted once.
+- **`openclaw.mcp_servers`** declares generic remote HTTPS OAuth servers by name; see
+  [mcp-provisioning.md](mcp-provisioning.md).
+
+Both models may be used on the same instance, but they must not name the same server.
+`onshape_mcp: true` together with `openclaw.mcp_servers.onshape` fails validation; neither
+model silently overrides the other. Every server either model writes is owned through
+the runtime ledger: a managed entry that was changed outside Clawake stops planning with
+`Managed field changed outside Clawake`, and an unchanged re-run plans no change.

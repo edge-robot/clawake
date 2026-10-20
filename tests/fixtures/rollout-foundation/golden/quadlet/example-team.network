@@ -1,0 +1,9 @@
+[Quadlet]
+DefaultDependencies=false
+
+[Unit]
+Description=Clawake shared network example-team
+
+[Network]
+NetworkName=example-team
+NetworkDeleteOnStop=true

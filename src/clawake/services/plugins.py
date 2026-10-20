@@ -74,6 +74,44 @@ def _verify_mounted_artifact(instance: InstanceSpec, plugin: PluginSpec) -> None
         )
 
 
+def npm_inspect_command(instance: InstanceSpec, plugin: PluginSpec) -> list[str]:
+    """Read-only `plugins inspect --runtime --json` argv for the npm skip check."""
+    return [
+        "podman",
+        "exec",
+        instance.container_name,
+        "openclaw",
+        "plugins",
+        "inspect",
+        plugin.id,
+        "--runtime",
+        "--json",
+    ]
+
+
+def npm_install_mismatch(plugin: PluginSpec, return_code: int, stdout: str) -> str | None:
+    """Return a reason code if the installed npm package differs from the pin, else None.
+
+    Same comparison as the post-install check (resolved spec and sha512 integrity); the
+    output is parsed but never echoed.
+    """
+    if return_code != 0:
+        return "plugin_missing"
+    try:
+        payload = json.loads(stdout)
+        installed = payload["install"]
+        actual_spec = installed["resolvedSpec"]
+        actual_integrity = installed["integrity"]
+        actual_id = payload["plugin"]["id"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return "inspect_unparseable"
+    if actual_id != plugin.id or actual_spec != plugin.npm_spec:
+        return "version_mismatch"
+    if actual_integrity != plugin.integrity:
+        return "integrity_mismatch"
+    return None
+
+
 def _verify_installed_npm_plugin(instance: InstanceSpec, plugin: PluginSpec) -> None:
     assert plugin.npm_spec is not None
     assert plugin.integrity is not None

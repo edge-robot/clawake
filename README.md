@@ -4,6 +4,11 @@
 inventory into rootless Podman containers managed by Quadlet and systemd user
 services. It brings deployment, diagnostics and upgrades into one local CLI.
 
+Use it as the operational foundation for teams working on software, robotics,
+project coordination, customer and supplier relationships, or personal assistance.
+Define each agent's responsibilities in role documents and provide the workspaces
+and tools needed for your projects.
+
 ## Why it exists
 
 Running an agent is only the beginning. A useful team needs persistent workspaces,
@@ -22,9 +27,11 @@ long-lived teams easier to maintain.
 Clawake owns the **deployment lifecycle** around OpenClaw: inventory validation,
 Quadlet generation, service operations, dashboard diagnostics and controlled
 upgrades. OpenClaw owns agent behavior, conversations and runtime data. Podman and
-systemd provide container execution and service supervision.
+systemd provide container execution and service supervision. Team-specific roles,
+communication and collaboration workflows are configured in OpenClaw and the
+agents' workspaces; deploying a team does not automatically orchestrate its work.
 
-Our vision is that operating a personal agent team becomes as understandable as
+Our vision is that operating an agent team becomes as understandable as
 maintaining its team definition: inspect the desired state, preview a change,
 apply it deliberately and see what is running. The current implementation targets
 a local Linux host with rootless Podman and systemd user services. Remote fleet
@@ -50,10 +57,20 @@ your team before applying it. Validation checks the inventory, rendering and
 installed artifact differences; it does not verify image availability or host
 runtime readiness.
 
+Inventory v2 adds offline validation for generic services alongside instances.
+See the [v2 model and validation boundary](docs/inventory-v2.md). In this increment,
+v2 rendering and lifecycle commands are blocked until service support is complete;
+existing v1 inventories retain their deployment behavior.
+
+For a complete three-member setup, see the [robotics team](robotics-team/README.md),
+whose three leads combine product and technical leadership, robotics engineering,
+and project, customer and supplier coordination. They communicate through OpenClaw
+A2A on a shared Podman network and delegate bounded work to native sub-agents.
+
 ```bash
 uv run clawake setup -c examples/staff/team.yml --execute
 uv run clawake status -c examples/staff/team.yml
-uv run clawake logs -c examples/staff/team.yml -m product-owner -n 50
+uv run clawake logs -c examples/staff/team.yml -m excalibot-product-owner -n 50
 ```
 
 Lifecycle changes default to a preview. `setup` renders and compares in memory;
@@ -93,6 +110,14 @@ Exit codes: `0` for success (including previews), `1` for operational failure,
 `2` for invalid CLI arguments or inventory. JSON status is emitted on stdout and
 remains available when an unhealthy service causes exit code `1`.
 
+For the existing self-hosted Onshape connector, `onshape_mcp: true` creates the
+local native MCP declaration with access disabled by default. An explicit
+`onshape_mcp_enabled: true` enables it with a finite four-tool filter (auth status,
+API explanation, schema and API call). Review and apply through `setup`; reconcile
+the named agent's explicit grants through `sync-plugins`. This setting grants no
+CAD write authority: the independently pinned MCP server still enforces its target
+and operation policy. Enabling requires `onshape_mcp: true`.
+
 Compatibility names: `setup-quadlets`, `restart-quadlets`, `status-quadlets`,
 `teardown-quadlets`, `onboard-member`, `diagnose-dashboard`.
 
@@ -113,13 +138,13 @@ orchestration can build on this boundary without introducing a second runtime.
 
 ## Operations and security
 
-Start with the [operator manual](docs/manual.md), including the Pflegebetreuer
-WhatsApp/API mismatch and the upgrade-to-channel-setup workflow. The
+Start with the [operator manual](docs/manual.md) for deployment, diagnostics,
+upgrades and channel configuration. The
 [user journey](docs/user_journey.md) distinguishes today's commands from the CLI
 vision: explain compatibility and access changes before applying a member-scoped plan.
 
-Our [security assessment](docs/security.md) recommends keeping Clawake lean for this
-multi-member deployment. The outer container limits the gateway and its plugins;
+Our [security assessment](docs/security.md) evaluates the operational boundaries of
+multi-agent deployments. The outer container limits the gateway and its plugins;
 Quadlet makes its configuration reproducible. Clawake must earn its maintenance cost
 through reliable checks and recovery. The assessment also covers when native OpenClaw
 or manually maintained Quadlets are sufficient, and records current hardening gaps.
@@ -137,3 +162,19 @@ uv run ruff check .
 
 Tests exercise rendering, validation and lifecycle operations with temporary files
 and simulated runtime adapters. They do not require deploying a live team.
+
+For fresh Omarchy source workspaces, use the [harness bootstrap guide](docs/omarchy-harness.md) and repo-scoped `clawake-harness` Codex skill.
+
+### Separate workspace and runtime state
+
+An instance may set `state_path` to an absolute host directory. All runtime
+configuration, plugin ownership ledgers, browser caches, doctor/upgrade mounts
+and backups use that directory. The default remains `workspace_path/.openclaw`.
+The container paths remain `/workspace` and `/home/node/.openclaw`. Configure
+separate state directories per instance; keep credentials, sessions and state
+out of version control. Migration copies the entire offline state before setup.
+
+`clawake stop -c INVENTORY` previews stopping only selected managed agents; add
+`--execute` to stop them without deleting Quadlets or state. Use `--member` for
+one agent. The external-token service supports `onshape-mcp --action stop` with
+the same preview/apply convention. Resume with managed setup/restart.

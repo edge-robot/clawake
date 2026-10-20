@@ -1,7 +1,18 @@
+{% if not instance.quadlet_default_dependencies %}
+[Quadlet]
+DefaultDependencies=false
+
+{% endif %}
 [Unit]
 Description=OpenClaw instance {{ instance.name }}
+{% if instance.quadlet_default_dependencies %}
 After=network-online.target
 Wants=network-online.target
+{% endif %}
+{% for dependency in instance.depends_on %}
+After={{ dependency }}.service
+Requires={{ dependency }}.service
+{% endfor %}
 {% for legacy_name in instance.legacy_names %}
 Conflicts={{ legacy_name }}.service
 {% endfor %}
@@ -18,8 +29,15 @@ EnvironmentFile={{ env_file }}
 {% endfor %}
 Volume={{ instance.workspace_path }}:/workspace
 Volume={{ instance.team_definition_path }}:/team-definition:ro
-Volume={{ instance.workspace_path }}/.openclaw:/home/node/.openclaw
+Volume={{ instance.runtime_state_path }}:/home/node/.openclaw
+{% if instance.networks %}
+{% for name in instance.networks %}
+Network={{ name }}.network
+{% endfor %}
+NetworkAlias={{ instance.container_name }}
+{% else %}
 Network={{ instance.network_quadlet_path }}
+{% endif %}
 {% for dns_server in instance.dns_servers %}
 DNS={{ dns_server }}
 {% endfor %}
@@ -32,7 +50,7 @@ Volume={{ plugin.artifact_path }}:{{ plugin.container_path }}:ro
 {% endif %}
 {% endfor %}
 {% for port in instance.ports %}
-PublishPort={{ port.bind_address }}:{{ port.host_port }}:{{ port.container_port }}/{{ port.protocol }}
+PublishPort={{ '[' ~ port.bind_address ~ ']' if ':' in port.bind_address else port.bind_address }}:{{ port.host_port }}:{{ port.container_port }}/{{ port.protocol }}
 {% endfor %}
 {% if instance.gateway_runtime.enabled %}
 Exec=openclaw gateway run --bind {{ instance.gateway_runtime.bind }} --port {{ instance.gateway_runtime.gateway_container_port }} --allow-unconfigured

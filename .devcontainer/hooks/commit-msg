@@ -1,0 +1,11 @@
+#!/bin/sh
+# Devcontainer commit-msg hook (owned by onshape-architekt).
+# Every agent commit must carry the traceability trailers.
+msg_file="$1"
+trailers=$(git interpret-trailers --parse "$msg_file")
+for key in Refs Prompt Agent Co-Authored-By; do
+  if ! printf '%s\n' "$trailers" | grep -q "^$key: "; then
+    echo "commit-msg: missing '$key:' trailer (see agent instructions)" >&2
+    exit 1
+  fi
+done

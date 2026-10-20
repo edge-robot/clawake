@@ -281,7 +281,7 @@ instances:
         load_inventory(cfg)
 
 
-def test_gateway_runtime_requires_gateway_and_bridge_ports(tmp_path: Path) -> None:
+def test_gateway_runtime_requires_explicit_bridge_port_mapping(tmp_path: Path) -> None:
     cfg = tmp_path / "gateway-runtime-missing-port.yaml"
     cfg.write_text(
         """
@@ -304,6 +304,7 @@ instances:
     gateway_runtime:
       enabled: true
       bind: loopback
+      bridge_container_port: 18790
     ports:
       - {bind_address: 127.0.0.1, host_port: 9010, container_port: 18789, protocol: tcp}
     dashboard: {friendly_name: One}
@@ -313,6 +314,39 @@ instances:
 
     with pytest.raises(ValueError, match="missing container ports"):
         load_inventory(cfg)
+
+
+def test_gateway_runtime_only_requires_gateway_port_by_default(tmp_path: Path) -> None:
+    cfg = tmp_path / "gateway-runtime.yaml"
+    cfg.write_text(
+        """
+version: 1
+cluster:
+  name: a
+  mode: single_host
+  primary_host: local
+hosts:
+  - name: local
+instances:
+  - name: one
+    host: local
+    role: developer
+    workspace_path: /srv/a/one/workspace
+    team_definition_path: /srv/a/one/role
+    quadlet_path: one.container
+    container_name: one
+    image: {repository: ghcr.io/x, tag: "1"}
+    gateway_runtime:
+      enabled: true
+      bind: loopback
+    ports:
+      - {bind_address: 127.0.0.1, host_port: 9010, container_port: 18789, protocol: tcp}
+    dashboard: {friendly_name: One}
+""",
+        encoding="utf-8",
+    )
+
+    assert load_inventory(cfg).instances[0].gateway_runtime.bridge_container_port is None
 
 
 def test_project_root_env_expands_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

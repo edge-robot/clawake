@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "agentToolAllow": {
+    "example-engineer": {
+      "key": "alsoAllow",
+      "tools": [
+        "cad_inspect",
+        "cad_status",
+        "onshape__onshape_auth_status",
+        "onshape__onshape_api_call"
+      ]
+    }
+  },
+  "globalToolAllow": [
+    "cad_inspect",
+    "cad_status",
+    "onshape__onshape_auth_status",
+    "onshape__onshape_api_call"
+  ]
+}
