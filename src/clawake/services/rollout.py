@@ -557,9 +557,6 @@ def _run_member(
     run.setup = outcome
     if outcome.result != "ok":
         return f"{outcome.action} failed ({', '.join(outcome.reasons) or 'no detail'})"
-    # Architecture-Ref: clawake/docs/architecture.md#lifecycle-contracts
-    # The doc says plugin installation remains an explicit `sync-plugins` action; ADR-003
-    # item 5 adds `rollout`, which runs the same sync after the setup action.
     rows, sync_failed = run_plugin_sync([instance], service, probes, echo=echo, on_result=on_result)
     run.rows = rows
     if sync_failed:

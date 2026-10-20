@@ -334,6 +334,39 @@ After the restart, `upgrade --execute` waits for readiness for up to
 takes the existing failure path: the upgraded service is stopped, and the backup paths
 are printed.
 
+Backups go to `.backups/` in the working directory, named with a sub-second UTC
+timestamp:
+
+- runtime archive: `<member>-<YYYYMMDDTHHMMSS.ffffffZ>.tar.gz`, for example
+  `example-lead-20261020T093015.123456Z.tar.gz` (also written by `rollout` and
+  `setup --adopt`);
+- inventory copy: `<inventory stem>-<YYYYMMDDTHHMMSS.ffffffZ><inventory suffix>`, for
+  example `team-20261020T093015.123987Z.json`, mode `0600`.
+
+Runtime archives contain the member's workspace and OpenClaw state. They are created
+with mode `0600` from the first byte; a failed write removes the partial archive. When
+Clawake creates `.backups/`, it creates it with mode `0700`. Clawake never changes the
+mode of an existing `.backups/`; if group or others can access it, every runtime backup
+prints to stderr:
+
+```text
+Warning: backup directory .backups is accessible by group or others; Clawake leaves its mode unchanged.
+```
+
+Run `chmod 700 .backups` to make it private. Previews create neither the directory nor
+an archive.
+
+A backup never replaces an existing file. If the target name already exists, the backup
+step fails with `Backup <path> already exists; refusing to overwrite it`. `upgrade` then
+changes no inventory and restarts the previous image.
+
+After a successful upgrade, Clawake keeps the newest `backup_policy.retention` archives of
+this member and the newest copies of this inventory. It only deletes files named exactly
+`<member>-<timestamp>.tar.gz` or `<inventory stem>-<timestamp><inventory suffix>`, with
+the timestamp in the format above or in the older one-second format
+(`20261019T101439Z`). Backups of another member whose name starts with `<member>-`, and
+every other file, are kept.
+
 ## Runtime pins (ADR-004)
 
 With `runtime_pins`, image tag/digest pins and archive plugin pins live in a private
@@ -447,7 +480,7 @@ planned)` and is not backed up.
    ```text
    Rollout stopped at example-lead: plugin sync or verification failed. Later members were not touched.
    The deployed state of example-lead now differs from the committed runtime pins.
-   Backups: .backups/example-lead-20261019T101439Z.tar.gz, .backups/pins-20261019T101439.342141Z.json
+   Backups: .backups/example-lead-20261019T101439.341872Z.tar.gz, .backups/pins-20261019T101439.342141Z.json
    To return to the committed pins, run: clawake rollout -c deploy/team.json -m example-lead --execute
    ```
 

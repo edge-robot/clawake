@@ -29,7 +29,12 @@ from clawake.services.runtime_pins import (
     set_plugin_pin,
     write_overlay,
 )
-from clawake.services.upgrade import apply_upgrade, build_upgrade_plan, rollback_to_known_good
+from clawake.services.upgrade import (
+    apply_upgrade,
+    build_upgrade_plan,
+    plan_overlay_upgrade,
+    rollback_to_known_good,
+)
 
 runner = CliRunner()
 
@@ -560,6 +565,24 @@ def test_upgrade_refuses_when_inventory_duplicates_the_image_field(tmp_path: Pat
     assert not (pins.parent / BACKUP_DIRNAME).exists()
 
 
+def test_overlay_upgrade_refuses_tag_change_without_digest(tmp_path: Path) -> None:
+    # #31: every library caller fails closed, not only the CLI.
+    inventory_path, pins = _split_setup(tmp_path)
+    before_inventory = inventory_path.read_bytes()
+    before_pins = pins.read_bytes()
+
+    with pytest.raises(ValueError, match="digest is required"):
+        plan_overlay_upgrade(inventory_path, "example-lead", "2026.2.0", None)
+    with pytest.raises(ValueError, match="digest is required"):
+        build_upgrade_plan(inventory_path, "example-lead", "2026.2.0", None)
+    with pytest.raises(ValueError, match="digest is required"):
+        apply_upgrade(inventory_path, "example-lead", "2026.2.0", None)
+
+    assert inventory_path.read_bytes() == before_inventory
+    assert pins.read_bytes() == before_pins
+    assert not (pins.parent / BACKUP_DIRNAME).exists()
+
+
 LEGACY_INVENTORY = """# operator comment
 version: 1
 instances:
@@ -871,3 +894,19 @@ def test_overlay_copy_is_not_mutated_by_merge(tmp_path: Path) -> None:
     )
 
     assert (raw, overlay) == snapshot
+
+
+def test_copy_overlay_creates_a_new_backup_directory_with_mode_0700(tmp_path: Path) -> None:
+    # #34: rollout may write the overlay copy before any runtime archive.
+    pins = tmp_path / "pins.json"
+    pins.write_text('{"version": 1}\n', encoding="utf-8")
+    pins.chmod(0o600)
+    output = tmp_path / "backups"
+    previous = os.umask(0o022)
+    try:
+        backup = runtime_pins.copy_overlay(pins, output)
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600

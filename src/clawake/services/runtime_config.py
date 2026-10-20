@@ -92,9 +92,6 @@ def desired_fields(inventory: Inventory, instance: InstanceSpec) -> dict:
         )
     if settings.discord is not None:
         # ADR-005 item 4: one owned field holding the whole object.
-        # Architecture-Ref: clawake/docs/architecture.md#shared-networks-and-leadership-teams
-        # The doc says unmanaged channels survive reconciliation; ADR-005 makes a declared
-        # channels.discord Clawake-owned (taken over once via setup --adopt discord-channel).
         desired[DISCORD_FIELD] = settings.discord.runtime_config()
     desired["channels/a2a/enabled"] = settings.a2a.enabled
     desired["plugins/entries/a2a/enabled"] = settings.a2a.enabled

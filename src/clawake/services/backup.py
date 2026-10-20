@@ -1,13 +1,94 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
+import stat
+import sys
 import tarfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 from clawake.config import InstanceSpec
 
 logger = logging.getLogger(__name__)
+
+Clock = Callable[[], datetime]
+
+# Sub-second UTC stamps, the same format as the runtime pins backups (#29).
+BACKUP_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
+# Names written before #29 have one-second stamps; pruning still recognises them (#28).
+LEGACY_BACKUP_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+_STAMP_PATTERN = r"(?P<stamp>\d{8}T\d{6}(?:\.\d{6})?Z)"
+PRIVATE_FILE_MODE = 0o600
+# A backup directory that Clawake creates is private to the operator (#34).
+BACKUP_DIR_MODE = 0o700
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def backup_stamp(now: Clock | None = None) -> str:
+    """UTC timestamp for a new backup name, e.g. ``20261020T093015.123456Z``."""
+    return (now or _utc_now)().astimezone(UTC).strftime(BACKUP_STAMP_FORMAT)
+
+
+def _already_exists(path: Path) -> FileExistsError:
+    return FileExistsError(f"Backup {path} already exists; refusing to overwrite it")
+
+
+def _create_private_file(path: Path) -> int:
+    """Open a new ``path`` for writing with mode 0600 before any byte is written.
+
+    The file is created exclusively and a symlink is never followed. The mode is fixed with
+    ``fchmod`` on the still empty file, so a restrictive umask cannot weaken it either.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, PRIVATE_FILE_MODE)
+    except FileExistsError as exc:
+        raise _already_exists(path) from exc
+    try:
+        os.fchmod(descriptor, PRIVATE_FILE_MODE)
+    except BaseException:
+        os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+    return descriptor
+
+
+def ensure_backup_dir(output_dir: Path) -> None:
+    """Create ``output_dir`` with mode 0700, or warn when an existing one is not private.
+
+    The mode of an existing directory is never changed; the warning names the path only.
+    """
+    try:
+        output_dir.mkdir(mode=BACKUP_DIR_MODE, parents=True)
+    except FileExistsError:
+        if not output_dir.is_dir():
+            raise
+        if stat.S_IMODE(output_dir.stat().st_mode) & 0o077:
+            print(
+                f"Warning: backup directory {output_dir} is accessible by group or others; "
+                "Clawake leaves its mode unchanged.",
+                file=sys.stderr,
+            )
+
+
+def write_new_private_file(path: Path, content: bytes) -> None:
+    """Create ``path`` exclusively with mode 0600; never overwrite or follow a symlink."""
+    descriptor = _create_private_file(path)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        # Never leave a partial backup that looks complete; the caller gets the error.
+        path.unlink(missing_ok=True)
+        raise
 
 
 def backup_sources(instance: InstanceSpec) -> list[Path]:
@@ -30,13 +111,21 @@ def backup_sources(instance: InstanceSpec) -> list[Path]:
     return unique
 
 
-def backup_instance(instance: InstanceSpec, output_dir: Path, execute: bool = False) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+def backup_instance(
+    instance: InstanceSpec,
+    output_dir: Path,
+    execute: bool = False,
+    *,
+    now: Clock | None = None,
+) -> Path:
+    stamp = backup_stamp(now)
     archive_path = output_dir / f"{instance.name}-{stamp}.tar.gz"
 
     if not execute:
+        # A preview only names the archive; it creates no directory and no file (#34).
         return archive_path
+
+    ensure_backup_dir(output_dir)
 
     warned_paths: set[Path] = set()
 
@@ -86,30 +175,64 @@ def backup_instance(instance: InstanceSpec, output_dir: Path, execute: bool = Fa
                 skip_legacy_workspace_runtime=skip_legacy_workspace_runtime,
             )
 
-    with tarfile.open(archive_path, "w:gz") as archive:
-        for idx, source in enumerate(backup_sources(instance), start=1):
-            if source.exists():
-                mount_identifier = source.name or f"path_{idx}"
-                _safe_add(
-                    archive,
-                    source,
-                    arcname=f"{idx:02d}__{mount_identifier}",
-                    skip_legacy_workspace_runtime=(
-                        source == Path(instance.workspace_path).expanduser()
-                    ),
-                )
+    # The archive holds workspace and OpenClaw state: it is created exclusively with mode
+    # 0600 before the first byte (#34) and never overwrites an earlier backup (#29).
+    descriptor = _create_private_file(archive_path)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            with tarfile.open(fileobj=handle, mode="w:gz") as archive:
+                for idx, source in enumerate(backup_sources(instance), start=1):
+                    if source.exists():
+                        mount_identifier = source.name or f"path_{idx}"
+                        _safe_add(
+                            archive,
+                            source,
+                            arcname=f"{idx:02d}__{mount_identifier}",
+                            skip_legacy_workspace_runtime=(
+                                source == Path(instance.workspace_path).expanduser()
+                            ),
+                        )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        # Never leave a partial archive that looks complete; the caller gets the error.
+        archive_path.unlink(missing_ok=True)
+        raise
 
     return archive_path
 
 
-def prune_backups(output_dir: Path, prefix: str, retention: int) -> list[Path]:
-    """Remove older matching backups while retaining the newest requested count."""
-    candidates = sorted(
-        (path for path in output_dir.glob(f"{prefix}*") if path.is_file()),
-        key=lambda path: (path.stat().st_mtime_ns, path.name),
-        reverse=True,
-    )
-    removed = candidates[retention:]
+def _parse_stamp(stamp: str) -> datetime | None:
+    """The UTC time of a backup stamp in either supported format, else ``None``."""
+    for pattern in (BACKUP_STAMP_FORMAT, LEGACY_BACKUP_STAMP_FORMAT):
+        try:
+            return datetime.strptime(stamp, pattern).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def prune_backups(output_dir: Path, name: str, retention: int, *, suffix: str) -> list[Path]:
+    """Remove older backups of exactly ``name`` and keep the newest ``retention`` ones.
+
+    Only regular files named ``<name>-<stamp><suffix>`` are candidates, with a second- or
+    sub-second-resolution stamp (#28). Anything else, including backups of ``<name>-<x>``,
+    is never deleted. Candidates are ordered by the time in their stamp.
+    """
+    if not output_dir.is_dir():
+        return []
+    pattern = re.compile(re.escape(f"{name}-") + _STAMP_PATTERN + re.escape(suffix))
+    candidates: list[tuple[datetime, str, Path]] = []
+    for entry in output_dir.iterdir():
+        match = pattern.fullmatch(entry.name)
+        if match is None or entry.is_symlink() or not entry.is_file():
+            continue
+        moment = _parse_stamp(match.group("stamp"))
+        if moment is None:
+            continue
+        candidates.append((moment, entry.name, entry))
+    candidates.sort(reverse=True)
+    removed = [entry for _moment, _name, entry in candidates[retention:]]
     for path in removed:
         path.unlink()
     return removed

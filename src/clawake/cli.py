@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import tarfile
 import warnings
 from pathlib import Path
 from typing import Annotated, Literal
@@ -656,9 +657,13 @@ def upgrade_member(
         typer.echo(f"Running image: {runtime.image_name}")
         typer.echo(f"Health check: {health_details}")
         if runtime_backup:
-            prune_backups(backup_dir, f"{instance.name}-", instance.backup_policy.retention)
+            prune_backups(
+                backup_dir, instance.name, instance.backup_policy.retention, suffix=".tar.gz"
+            )
         if config_backup:
-            prune_backups(backup_dir, f"{config.stem}-", instance.backup_policy.retention)
+            prune_backups(
+                backup_dir, config.stem, instance.backup_policy.retention, suffix=config.suffix
+            )
     except (ImageCheckError, OSError, RuntimeError, ValueError) as exc:
         typer.echo(f"Upgrade failed: {exc}", err=True)
         if stopped and not config_changed:
@@ -855,7 +860,8 @@ def setup_quadlets(
             continue
         try:
             archive = backup_instance(instance, BACKUP_DIR, execute=True)
-        except OSError as exc:
+        except (OSError, tarfile.TarError) as exc:
+            # Like rollout: a failed backup aborts before any write (explicit error, exit 1).
             typer.echo(
                 f"Backup before adopting {', '.join(adoptions[instance.name])} for "
                 f"{instance.name} failed: {exc}. Nothing was changed.",
@@ -892,8 +898,6 @@ def setup_quadlets(
         typer.echo("No rendered changes detected; starting only inactive members.")
 
     # Restart only changed members; start unchanged inactive ones (#5 problem 1).
-    # Architecture-Ref: clawake/docs/architecture.md#lifecycle-contracts
-    # The doc still says setup restarts unchanged members; ADR-003 item 3 supersedes it.
     outcomes = run_setup_actions(
         selected, actions, service, probes, echo=typer.echo, on_result=_print_result
     )
@@ -996,8 +1000,6 @@ def status_quadlets(
     timeout: WaitTimeout = None,
 ) -> None:
     """Aggregate per-member runtime status and readiness with optional JSON output."""
-    # Architecture-Ref: clawake/docs/architecture.md#ownership-and-isolation
-    # The doc still says status represents systemd state only; ADR-003 adds readiness.
     inventory = _load(config, validation_only=True)
     if inventory.version == 2:
         if wait or timeout is not None:

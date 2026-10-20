@@ -1,4 +1,8 @@
 import json
+import os
+import re
+import stat
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -187,7 +191,8 @@ def test_apply_upgrade_never_writes_literal_none_in_yaml(tmp_path: Path) -> None
         encoding="utf-8",
     )
 
-    apply_upgrade(config, "one", "new", None)
+    # Same tag, no digest: the plan's digest stays None (#31 refuses a tag change without one).
+    apply_upgrade(config, "one", "old", None)
 
     text = config.read_text(encoding="utf-8")
     assert "None" not in text
@@ -195,7 +200,7 @@ def test_apply_upgrade_never_writes_literal_none_in_yaml(tmp_path: Path) -> None
     image = yaml.safe_load(text)["instances"][0]["image"]
     assert image == {
         "repository": "ghcr.io/openclaw/openclaw",
-        "tag": "new",
+        "tag": "old",
         "known_good_tag": "old",
     }
 
@@ -206,13 +211,15 @@ def test_apply_upgrade_never_writes_null_in_json(tmp_path: Path) -> None:
     del data["instances"][0]["image"]["digest"]
     _write_json(config, data)
 
-    apply_upgrade(config, "one", "2026.10.1", None)
+    # Same tag, no digest: the plan's digest stays None (#31 refuses a tag change without one).
+    apply_upgrade(config, "one", "2026.9.9", None)
 
     text = config.read_text(encoding="utf-8")
     assert "null" not in text
     image = json.loads(text)["instances"][0]["image"]
     assert "digest" not in image
-    assert image["tag"] == "2026.10.1"
+    assert image["tag"] == "2026.9.9"
+    assert image["known_good_tag"] == "2026.9.9"
 
 
 @pytest.mark.parametrize("name", ["team.json", "team.yml", "team.yaml"])
@@ -225,3 +232,176 @@ def test_backup_config_keeps_the_original_suffix(tmp_path: Path, name: str) -> N
     assert backup.suffix == config.suffix
     assert backup.name.startswith("team-")
     assert backup.read_bytes() == config.read_bytes()
+
+
+# --- #31: a tag change without a digest fails closed in the library ------------------------
+
+_UNPINNED_YAML = """instances:
+  - name: one
+    image:
+      repository: ghcr.io/openclaw/openclaw
+      tag: "old"
+      digest: sha256:old
+"""
+
+
+def test_build_upgrade_plan_refuses_tag_change_without_digest(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_UNPINNED_YAML, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="digest is required"):
+        build_upgrade_plan(config, "one", next_tag="new", next_digest=None)
+
+
+def test_apply_upgrade_refuses_tag_change_without_digest_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_UNPINNED_YAML, encoding="utf-8")
+    before = config.read_bytes()
+
+    with pytest.raises(ValueError, match="digest is required"):
+        apply_upgrade(config, "one", "new", None)
+
+    assert config.read_bytes() == before
+
+
+def test_same_tag_without_digest_keeps_the_current_digest(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_UNPINNED_YAML, encoding="utf-8")
+
+    plan = build_upgrade_plan(config, "one", next_tag="old", next_digest=None)
+
+    assert (plan.next_tag, plan.next_digest) == ("old", "sha256:old")
+
+
+# --- #30: YAML inventory writes are atomic ----------------------------------------------------
+
+_BLOCK_YAML = """# operator comment
+instances:
+  - name: one
+    image:
+      repository: ghcr.io/openclaw/openclaw
+      tag: "old" # pinned by hand
+      digest: sha256:old
+"""
+
+_FLOW_YAML = """instances:
+  - name: one
+    image: {repository: ghcr.io/openclaw/openclaw, tag: old, digest: 'sha256:old'}
+    labels: {a: b}
+"""
+
+
+@pytest.mark.parametrize("original", [_BLOCK_YAML, _FLOW_YAML], ids=["block", "flow"])
+def test_interrupted_yaml_replace_leaves_the_original_inventory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, original: str
+) -> None:
+    from clawake.services import upgrade
+
+    config = tmp_path / "team.yml"
+    config.write_text(original, encoding="utf-8")
+    config.chmod(0o640)
+
+    def interrupted_replace(source: object, target: object) -> None:
+        raise OSError("synthetic interruption before rename")
+
+    monkeypatch.setattr(upgrade.os, "replace", interrupted_replace)
+
+    with pytest.raises(OSError, match="synthetic interruption"):
+        apply_upgrade(config, "one", "new", "sha256:new")
+
+    assert config.read_text(encoding="utf-8") == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["team.yml"]
+
+
+def test_flow_style_yaml_upgrade_output_is_unchanged(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_FLOW_YAML, encoding="utf-8")
+    config.chmod(0o640)
+
+    apply_upgrade(config, "one", "new", "sha256:new")
+
+    assert config.read_text(encoding="utf-8") == (
+        "instances:\n"
+        "  - name: one\n"
+        "    image: {repository: ghcr.io/openclaw/openclaw, tag: new, digest: 'sha256:new',"
+        " known_good_tag: old,\n"
+        "  known_good_digest: 'sha256:old'}\n"
+        "    labels: {a: b}\n"
+    )
+    assert config.stat().st_mode & 0o777 == 0o640
+
+
+# --- #29: config backups never overwrite each other -------------------------------------------
+
+
+def _fixed_clock(*moments: datetime):
+    remaining = list(moments)
+
+    def now() -> datetime:
+        return remaining.pop(0)
+
+    return now
+
+
+_SAME_SECOND = (
+    datetime(2026, 10, 20, 9, 30, 15, 1, tzinfo=UTC),
+    datetime(2026, 10, 20, 9, 30, 15, 2, tzinfo=UTC),
+)
+
+
+def test_two_config_backups_in_the_same_second_produce_two_files(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text("version: 1\n", encoding="utf-8")
+    output = tmp_path / "backups"
+    clock = _fixed_clock(*_SAME_SECOND)
+
+    first = backup_config(config, output, now=clock)
+    config.write_text("version: 1\n# second\n", encoding="utf-8")
+    second = backup_config(config, output, now=clock)
+
+    assert first.name == "team-20261020T093015.000001Z.yml"
+    assert second.name == "team-20261020T093015.000002Z.yml"
+    assert first.read_text(encoding="utf-8") == "version: 1\n"
+    assert second.read_text(encoding="utf-8") == "version: 1\n# second\n"
+
+
+def test_config_backup_fails_closed_when_the_target_exists(tmp_path: Path) -> None:
+    config = tmp_path / "team.json"
+    config.write_text('{"version": 1}\n', encoding="utf-8")
+    output = tmp_path / "backups"
+    output.mkdir()
+    existing = output / "team-20261020T093015.000001Z.json"
+    existing.write_text("earlier backup\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        backup_config(config, output, now=_fixed_clock(_SAME_SECOND[0]))
+
+    assert existing.read_text(encoding="utf-8") == "earlier backup\n"
+
+
+def test_config_backup_is_private(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text("version: 1\n", encoding="utf-8")
+    config.chmod(0o644)
+
+    backup = backup_config(config, tmp_path / "backups")
+
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert re.fullmatch(r"team-\d{8}T\d{6}\.\d{6}Z\.yml", backup.name)
+
+
+def test_backup_config_creates_a_new_backup_directory_with_mode_0700(tmp_path: Path) -> None:
+    # #34: the inventory copy is often the first file written to .backups/.
+    config = tmp_path / "team.json"
+    config.write_text('{"version": 1}\n', encoding="utf-8")
+    output = tmp_path / "backups"
+    previous = os.umask(0o022)
+    try:
+        backup = backup_config(config, output)
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600

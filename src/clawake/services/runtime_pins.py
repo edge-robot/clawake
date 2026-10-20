@@ -642,7 +642,8 @@ def copy_overlay(path: Path, output_dir: Path, *, now: Clock | None = None) -> P
     clock = now or (lambda: datetime.now(UTC))
     _refuse_symlink(output_dir, "backup directory")
     previous = _read_previous(path)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # A new backup directory is private, like the runtime archives in it (#34).
+    output_dir.mkdir(mode=DIRECTORY_MODE, parents=True, exist_ok=True)
     stamp = clock().astimezone(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
     for attempt in range(100):
         suffix = "" if attempt == 0 else f"-{attempt}"

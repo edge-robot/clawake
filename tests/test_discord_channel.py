@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -764,6 +765,34 @@ def test_backup_failure_stops_adoption_before_any_write(
 
     assert result.exit_code == 1, result.output
     assert "Backup before adopting discord-channel for lead failed: disk full" in result.output
+    assert _snapshot(tmp_path) == before
+    assert host.calls == []
+
+
+def test_tar_error_in_adoption_backup_stops_cleanly_before_any_write(
+    tmp_path: Path, host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #34: a TarError is a clean error like an OSError, not a traceback.
+    cfg = _team(tmp_path)
+    _write_live(tmp_path, "lead", {"channels": {"discord": _hand_written(SECRET_REF)}})
+    before = _snapshot(tmp_path)
+
+    def failing_backup(instance, output_dir, execute=False):
+        raise tarfile.TarError("synthetic archive failure")
+
+    monkeypatch.setattr(cli, "backup_instance", failing_backup)
+
+    result = _invoke(
+        "setup", "-c", str(cfg), "-m", "lead", "--adopt", "discord-channel", "--execute"
+    )
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+    assert (
+        "Backup before adopting discord-channel for lead failed: synthetic archive failure. "
+        "Nothing was changed." in result.output
+    )
     assert _snapshot(tmp_path) == before
     assert host.calls == []
 

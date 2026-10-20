@@ -1,5 +1,10 @@
+import os
+import stat
 import tarfile
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from clawake.config import BackupPolicy, DashboardMeta, ImageSpec, InstanceSpec
 from clawake.services.backup import backup_instance, prune_backups
@@ -92,13 +97,254 @@ def test_backup_instance_skips_legacy_workspace_runtime_tree(tmp_path: Path) -> 
 def test_prune_backups_retains_newest_matching_files(tmp_path: Path) -> None:
     backups = tmp_path / "backups"
     backups.mkdir()
-    paths = [backups / f"one-{number}.tar.gz" for number in range(3)]
+    paths = [backups / f"one-2026102{number}T093015.000001Z.tar.gz" for number in range(3)]
     for path in paths:
         path.write_text(path.name, encoding="utf-8")
 
-    removed = prune_backups(backups, "one-", retention=2)
+    removed = prune_backups(backups, "one", retention=2, suffix=".tar.gz")
 
     assert removed == [paths[0]]
     assert not paths[0].exists()
     assert paths[1].exists()
     assert paths[2].exists()
+
+
+# --- #29: runtime archives never overwrite each other -----------------------------------------
+
+
+def _fixed_clock(*moments: datetime):
+    remaining = list(moments)
+
+    def now() -> datetime:
+        return remaining.pop(0)
+
+    return now
+
+
+_SAME_SECOND = (
+    datetime(2026, 10, 20, 9, 30, 15, 1, tzinfo=UTC),
+    datetime(2026, 10, 20, 9, 30, 15, 2, tzinfo=UTC),
+)
+
+
+def _small_instance(tmp_path: Path) -> InstanceSpec:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.txt").write_text("workspace data\n", encoding="utf-8")
+    return _instance_with_paths(workspace, tmp_path / "team")
+
+
+def test_two_runtime_backups_in_the_same_second_produce_two_archives(tmp_path: Path) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    clock = _fixed_clock(*_SAME_SECOND)
+
+    first = backup_instance(instance, output, execute=True, now=clock)
+    second = backup_instance(instance, output, execute=True, now=clock)
+
+    assert first.name == "one-20261020T093015.000001Z.tar.gz"
+    assert second.name == "one-20261020T093015.000002Z.tar.gz"
+    assert sorted(path.name for path in output.iterdir()) == [first.name, second.name]
+
+
+def test_runtime_backup_fails_closed_when_the_archive_exists(tmp_path: Path) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    output.mkdir()
+    existing = output / "one-20261020T093015.000001Z.tar.gz"
+    existing.write_bytes(b"earlier archive")
+
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        backup_instance(instance, output, execute=True, now=_fixed_clock(_SAME_SECOND[0]))
+
+    assert existing.read_bytes() == b"earlier archive"
+
+
+# --- #28: pruning selects exactly one member's or config's backups ----------------------------
+
+
+def _touch(directory: Path, *names: str) -> list[Path]:
+    paths = [directory / name for name in names]
+    for path in paths:
+        path.write_text(path.name, encoding="utf-8")
+    return paths
+
+
+def _names(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.iterdir())
+
+
+def test_pruning_member_a_keeps_every_backup_of_member_a_b(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    a_b = _touch(
+        backups,
+        "a-b-20261018T080000Z.tar.gz",
+        "a-b-20261019T080000.000001Z.tar.gz",
+        "a-b-20261020T080000.000001Z.tar.gz",
+    )
+    _touch(backups, "a-20261018T090000Z.tar.gz", "a-20261020T090000.000001Z.tar.gz")
+
+    removed = prune_backups(backups, "a", retention=1, suffix=".tar.gz")
+
+    assert [path.name for path in removed] == ["a-20261018T090000Z.tar.gz"]
+    assert all(path.exists() for path in a_b)
+    assert "a-20261020T090000.000001Z.tar.gz" in _names(backups)
+
+
+def test_pruning_handles_second_and_sub_second_names_by_their_timestamp(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    _touch(
+        backups,
+        "one-20261018T101439Z.tar.gz",  # old second-resolution name, oldest
+        "one-20261019T101439.342141Z.tar.gz",
+        "one-20261020T101439Z.tar.gz",  # old name, but the newest backup
+        "one-20261019T101439.342142Z.tar.gz",
+    )
+
+    removed = prune_backups(backups, "one", retention=2, suffix=".tar.gz")
+
+    assert sorted(path.name for path in removed) == [
+        "one-20261018T101439Z.tar.gz",
+        "one-20261019T101439.342141Z.tar.gz",
+    ]
+    assert _names(backups) == [
+        "one-20261019T101439.342142Z.tar.gz",
+        "one-20261020T101439Z.tar.gz",
+    ]
+
+
+def test_pruning_never_deletes_files_that_do_not_parse(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    unparseable = _touch(
+        backups,
+        "one-latest.tar.gz",
+        "one-20261020T101439Z.tar.gz.partial",
+        "one-20261020T101439.342Z.tar.gz",
+        "one-20261020T101439Z-1.tar.gz",
+        "one-20261320T101439Z.tar.gz",  # month 13
+        "one-20261019T101439Z.tgz",
+        "notes-one-20261019T101439Z.tar.gz",
+    )
+    _touch(backups, "one-20261019T101439Z.tar.gz", "one-20261020T101439Z.tar.gz")
+    (backups / "one-20261018T101439Z.tar.gz").symlink_to(backups / "one-latest.tar.gz")
+
+    removed = prune_backups(backups, "one", retention=1, suffix=".tar.gz")
+
+    assert [path.name for path in removed] == ["one-20261019T101439Z.tar.gz"]
+    assert all(path.exists() for path in unparseable)
+    assert (backups / "one-20261018T101439Z.tar.gz").is_symlink()
+
+
+def test_pruning_a_config_keeps_member_archives_and_other_configs(tmp_path: Path) -> None:
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    kept = _touch(
+        backups,
+        "team-20261018T101439Z.tar.gz",  # member named "team"
+        "team-b-20261018T101439Z.json",  # inventory team-b.json
+        "team-20261018T101439Z.yml",  # same stem, other suffix
+    )
+    _touch(backups, "team-20261018T101439Z.json", "team-20261019T101439.000001Z.json")
+
+    removed = prune_backups(backups, "team", retention=1, suffix=".json")
+
+    assert [path.name for path in removed] == ["team-20261018T101439Z.json"]
+    assert all(path.exists() for path in kept)
+
+
+def test_pruning_a_missing_directory_removes_nothing(tmp_path: Path) -> None:
+    assert prune_backups(tmp_path / "absent", "one", retention=1, suffix=".tar.gz") == []
+
+
+# --- #34: private runtime archives and backup directories --------------------------------------
+
+
+@pytest.fixture
+def permissive_umask():
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def test_runtime_archive_is_created_with_mode_0600(tmp_path: Path, permissive_umask) -> None:
+    instance = _small_instance(tmp_path)
+
+    archive = backup_instance(instance, tmp_path / "backups", execute=True)
+
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    with tarfile.open(archive, "r:gz") as tar:
+        assert any(name.endswith("/README.txt") for name in tar.getnames())
+
+
+def test_new_backup_directory_is_created_with_mode_0700(
+    tmp_path: Path, permissive_umask, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+
+    backup_instance(instance, output, execute=True)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert capsys.readouterr().err == ""
+
+
+def test_open_existing_backup_directory_is_kept_and_warned_about(
+    tmp_path: Path, permissive_umask, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    output.mkdir(mode=0o755)
+
+    archive = backup_instance(instance, output, execute=True)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o755
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    err = capsys.readouterr().err
+    assert err == (
+        f"Warning: backup directory {output} is accessible by group or others; "
+        "Clawake leaves its mode unchanged.\n"
+    )
+
+
+def test_private_existing_backup_directory_gives_no_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+    output.mkdir(mode=0o700)
+
+    backup_instance(instance, output, execute=True)
+
+    assert capsys.readouterr().err == ""
+
+
+def test_runtime_backup_preview_creates_no_directory(tmp_path: Path) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "nested" / "backups"
+
+    archive = backup_instance(instance, output, execute=False, now=_fixed_clock(_SAME_SECOND[0]))
+
+    assert archive == output / "one-20261020T093015.000001Z.tar.gz"
+    assert not (tmp_path / "nested").exists()
+
+
+def test_failure_while_writing_the_archive_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance = _small_instance(tmp_path)
+    output = tmp_path / "backups"
+
+    def broken_addfile(self, tarinfo, fileobj=None):
+        raise tarfile.TarError("synthetic write failure")
+
+    monkeypatch.setattr(tarfile.TarFile, "addfile", broken_addfile)
+
+    with pytest.raises(tarfile.TarError, match="synthetic write failure"):
+        backup_instance(instance, output, execute=True)
+
+    assert list(output.iterdir()) == []

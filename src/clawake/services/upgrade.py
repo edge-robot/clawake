@@ -6,12 +6,17 @@ import re
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
 
 from clawake.services import runtime_pins
+from clawake.services.backup import (
+    BACKUP_DIR_MODE,
+    Clock,
+    backup_stamp,
+    write_new_private_file,
+)
 
 
 @dataclass
@@ -153,9 +158,9 @@ def _update_image_fields(
         image = dict(next(item for item in data[section] if item["name"] == instance_name)["image"])
         image.update(values)
         replacement = yaml.safe_dump(image, default_flow_style=True, sort_keys=False).strip()
-        config_path.write_text(
+        _write_text_atomic(
+            config_path,
             raw[: image_node.start_mark.index] + replacement + raw[image_node.end_mark.index :],
-            encoding="utf-8",
         )
         return
     image_index = image_key.start_mark.line
@@ -187,7 +192,7 @@ def _update_image_fields(
                 for existing_key, existing_index in positions.items()
             }
 
-    config_path.write_text("".join(lines), encoding="utf-8")
+    _write_text_atomic(config_path, "".join(lines))
 
 
 def _plan_from_image(
@@ -196,6 +201,12 @@ def _plan_from_image(
     next_tag: str | None,
     next_digest: str | None,
 ) -> UpgradePlan:
+    # #31: fail closed for every library caller; never pair a new tag with the old digest.
+    if next_tag is not None and next_tag != image["tag"] and next_digest is None:
+        raise ValueError(
+            f"An immutable digest is required when changing the tag of '{instance_name}' "
+            f"({image['tag']} -> {next_tag})"
+        )
     return UpgradePlan(
         instance=instance_name,
         previous_tag=image["tag"],
@@ -327,10 +338,12 @@ def rollback_to_known_good(config_path: Path, instance_name: str) -> UpgradePlan
     return plan
 
 
-def backup_config(config_path: Path, output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+def backup_config(config_path: Path, output_dir: Path, *, now: Clock | None = None) -> Path:
+    """Copy the inventory into ``output_dir`` as a new 0600 file; never overwrites (#29)."""
+    content = config_path.read_bytes()
+    # A new backup directory is private (#34); backup_instance warns about an open one.
+    output_dir.mkdir(mode=BACKUP_DIR_MODE, parents=True, exist_ok=True)
     # Keep the original suffix: a JSON inventory is backed up as .json (#27).
-    backup_path = output_dir / f"{config_path.stem}-{stamp}{config_path.suffix}"
-    backup_path.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    backup_path = output_dir / f"{config_path.stem}-{backup_stamp(now)}{config_path.suffix}"
+    write_new_private_file(backup_path, content)
     return backup_path

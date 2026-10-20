@@ -220,6 +220,15 @@ def test_upgrade_execute_runs_backup_migration_and_health_checks(
             error="",
         ),
     )
+    # #28: older backups of this member and inventory, and of look-alike names.
+    backups = tmp_path / ".backups"
+    backups.mkdir()
+    seeded_own = [f"one-2026010{day}T000000Z.tar.gz" for day in range(1, 7)]
+    seeded_own += [f"inventory-2026010{day}T000000Z.yml" for day in range(1, 7)]
+    seeded_other = [f"one-b-2026010{day}T000000Z.tar.gz" for day in range(1, 7)]
+    seeded_other += [f"inventory-b-2026010{day}T000000Z.yml" for day in range(1, 7)]
+    for name in seeded_own + seeded_other:
+        (backups / name).write_text("synthetic backup\n", encoding="utf-8")
 
     result = runner.invoke(
         app,
@@ -241,6 +250,15 @@ def test_upgrade_execute_runs_backup_migration_and_health_checks(
     assert RecordingSystemdService.calls == ["stop", "reload", "restart"]
     assert "Upgrade complete: OpenClaw 2026.8.2" in result.output
     assert list((tmp_path / ".backups").glob("one-*.tar.gz"))
+    # Retention 5 keeps the new backup plus the four newest seeded ones per kind.
+    remaining = {path.name for path in backups.iterdir()}
+    assert set(seeded_other) <= remaining
+    assert {name for name in seeded_own if name in remaining} == {
+        f"{stem}-2026010{day}T000000Z.{suffix}"
+        for stem, suffix in (("one", "tar.gz"), ("inventory", "yml"))
+        for day in range(3, 7)
+    }
+    assert len(remaining) == len(seeded_other) + 10
     image = yaml.safe_load(cfg.read_text(encoding="utf-8"))["instances"][0]["image"]
     assert image["tag"] == "2026.8.2"
     assert image["digest"] == "sha256:new"
