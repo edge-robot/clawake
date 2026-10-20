@@ -11,7 +11,7 @@ or values from a deployed inventory here; refer to private evidence instead.
 ## ADR-001: Ownership ledger semantics for managed OpenClaw runtime config
 
 Status: Accepted (2026-10-16). Implemented on `integrate/rollout-foundation`
-(edge-robot/clawake#25, merge 55ea8df). Documentation in `architecture.md` pending.
+(edge-robot/clawake#25, merge 55ea8df). Documented in `architecture.md` (Shared networks and leadership teams).
 
 ### Context
 
