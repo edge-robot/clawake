@@ -196,6 +196,12 @@ def _plan_from_image(
     next_tag: str | None,
     next_digest: str | None,
 ) -> UpgradePlan:
+    # #31: fail closed for every library caller; never pair a new tag with the old digest.
+    if next_tag is not None and next_tag != image["tag"] and next_digest is None:
+        raise ValueError(
+            f"An immutable digest is required when changing the tag of '{instance_name}' "
+            f"({image['tag']} -> {next_tag})"
+        )
     return UpgradePlan(
         instance=instance_name,
         previous_tag=image["tag"],

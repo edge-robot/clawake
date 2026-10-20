@@ -29,7 +29,12 @@ from clawake.services.runtime_pins import (
     set_plugin_pin,
     write_overlay,
 )
-from clawake.services.upgrade import apply_upgrade, build_upgrade_plan, rollback_to_known_good
+from clawake.services.upgrade import (
+    apply_upgrade,
+    build_upgrade_plan,
+    plan_overlay_upgrade,
+    rollback_to_known_good,
+)
 
 runner = CliRunner()
 
@@ -554,6 +559,24 @@ def test_upgrade_refuses_when_inventory_duplicates_the_image_field(tmp_path: Pat
 
     with pytest.raises(RuntimePinsError, match="conflict"):
         apply_upgrade(inventory_path, "example-lead", "2026.2.0", DIGEST_C)
+
+    assert inventory_path.read_bytes() == before_inventory
+    assert pins.read_bytes() == before_pins
+    assert not (pins.parent / BACKUP_DIRNAME).exists()
+
+
+def test_overlay_upgrade_refuses_tag_change_without_digest(tmp_path: Path) -> None:
+    # #31: every library caller fails closed, not only the CLI.
+    inventory_path, pins = _split_setup(tmp_path)
+    before_inventory = inventory_path.read_bytes()
+    before_pins = pins.read_bytes()
+
+    with pytest.raises(ValueError, match="digest is required"):
+        plan_overlay_upgrade(inventory_path, "example-lead", "2026.2.0", None)
+    with pytest.raises(ValueError, match="digest is required"):
+        build_upgrade_plan(inventory_path, "example-lead", "2026.2.0", None)
+    with pytest.raises(ValueError, match="digest is required"):
+        apply_upgrade(inventory_path, "example-lead", "2026.2.0", None)
 
     assert inventory_path.read_bytes() == before_inventory
     assert pins.read_bytes() == before_pins

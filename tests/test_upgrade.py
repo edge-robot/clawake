@@ -187,7 +187,8 @@ def test_apply_upgrade_never_writes_literal_none_in_yaml(tmp_path: Path) -> None
         encoding="utf-8",
     )
 
-    apply_upgrade(config, "one", "new", None)
+    # Same tag, no digest: the plan's digest stays None (#31 refuses a tag change without one).
+    apply_upgrade(config, "one", "old", None)
 
     text = config.read_text(encoding="utf-8")
     assert "None" not in text
@@ -195,7 +196,7 @@ def test_apply_upgrade_never_writes_literal_none_in_yaml(tmp_path: Path) -> None
     image = yaml.safe_load(text)["instances"][0]["image"]
     assert image == {
         "repository": "ghcr.io/openclaw/openclaw",
-        "tag": "new",
+        "tag": "old",
         "known_good_tag": "old",
     }
 
@@ -206,13 +207,15 @@ def test_apply_upgrade_never_writes_null_in_json(tmp_path: Path) -> None:
     del data["instances"][0]["image"]["digest"]
     _write_json(config, data)
 
-    apply_upgrade(config, "one", "2026.10.1", None)
+    # Same tag, no digest: the plan's digest stays None (#31 refuses a tag change without one).
+    apply_upgrade(config, "one", "2026.9.9", None)
 
     text = config.read_text(encoding="utf-8")
     assert "null" not in text
     image = json.loads(text)["instances"][0]["image"]
     assert "digest" not in image
-    assert image["tag"] == "2026.10.1"
+    assert image["tag"] == "2026.9.9"
+    assert image["known_good_tag"] == "2026.9.9"
 
 
 @pytest.mark.parametrize("name", ["team.json", "team.yml", "team.yaml"])
@@ -225,3 +228,44 @@ def test_backup_config_keeps_the_original_suffix(tmp_path: Path, name: str) -> N
     assert backup.suffix == config.suffix
     assert backup.name.startswith("team-")
     assert backup.read_bytes() == config.read_bytes()
+
+
+# --- #31: a tag change without a digest fails closed in the library ------------------------
+
+_UNPINNED_YAML = """instances:
+  - name: one
+    image:
+      repository: ghcr.io/openclaw/openclaw
+      tag: "old"
+      digest: sha256:old
+"""
+
+
+def test_build_upgrade_plan_refuses_tag_change_without_digest(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_UNPINNED_YAML, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="digest is required"):
+        build_upgrade_plan(config, "one", next_tag="new", next_digest=None)
+
+
+def test_apply_upgrade_refuses_tag_change_without_digest_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_UNPINNED_YAML, encoding="utf-8")
+    before = config.read_bytes()
+
+    with pytest.raises(ValueError, match="digest is required"):
+        apply_upgrade(config, "one", "new", None)
+
+    assert config.read_bytes() == before
+
+
+def test_same_tag_without_digest_keeps_the_current_digest(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_UNPINNED_YAML, encoding="utf-8")
+
+    plan = build_upgrade_plan(config, "one", next_tag="old", next_digest=None)
+
+    assert (plan.next_tag, plan.next_digest) == ("old", "sha256:old")
