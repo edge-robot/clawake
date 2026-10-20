@@ -228,6 +228,63 @@ eine Migration ist ein vollständiges, geprüftes Offline-Backup erforderlich.
 die ausgewählten Dienste an und erhält Daten und Quadlets. Für den MCP-Dienst
 entsprechend `clawake onshape-mcp -c SERVICE --action stop [--execute]`.
 
+## Onshape MCP service health (`onshape-mcp`)
+
+The service file (`service.json` or YAML) may contain an optional `health` block:
+
+| key | default | rule |
+| --- | --- | --- |
+| `command` | `["curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]` | 1–16 non-empty, single-line arguments without `%` or `$`; `command[0]` is an absolute path or a bare executable name |
+| `interval_s` | `30` | 1–3600 |
+| `timeout_s` | `5` | 1–600 |
+| `retries` | `3` | 1–100 |
+| `start_period_s` | `0` | 0–3600; `HealthStartPeriod=` is rendered only when > 0 |
+
+Without `health`, the quadlet is unchanged: the default `curl` check runs through
+`/bin/sh` in the image, as before. Any other `command` is rendered without a shell
+(`HealthCmd=["CMD",...]`), so distroless images work. `HealthOnFailure=kill` always
+applies. For images that ship `onshape-mcp healthcheck` (exit 0 on HTTP 200, 1 otherwise,
+loopback only):
+
+```json
+"health": {"command": ["/usr/local/bin/onshape-mcp", "healthcheck"]}
+```
+
+renders
+
+```text
+HealthCmd=["CMD","/usr/local/bin/onshape-mcp","healthcheck"]
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthOnFailure=kill
+```
+
+**Preflight.** `--action plan` and `--action apply` (preview and `--execute`) first check
+that the pinned image can execute the health command, before anything is written:
+`podman run --rm --pull=never --network=none --entrypoint <command[0]> <image> --help`
+(for the default also `/bin/sh`). The image must already be in local storage. If it
+cannot, the command exits 1 with, for example:
+
+```text
+Onshape MCP image <image> cannot run health command <command[0]>: executable missing or not runnable (podman exit 127)
+Onshape MCP preflight could not run image <image> for health command <command[0]>: podman exit 125 (the image must be in local storage)
+```
+
+**Health wait.** After `--action apply --execute` restarts the service, Clawake polls
+`podman inspect --format {{.State.Health.Status}} <name>` and
+`systemctl --user show --property=NRestarts --value <name>.service` for at most
+`start_period_s + interval_s × (retries + 1) + 30` seconds (150 s with the defaults).
+Success needs `healthy` with no restart during the wait:
+`Onshape MCP service healthy after <n>s; credential readiness unverified`. Otherwise it
+exits 1 with `Onshape MCP service not healthy: <state>, restarts +<n>`, where `<state>`
+is `unhealthy`, `timeout after <w>s (last state <state>)`, the current state when systemd
+restarted the service, or `restart count unavailable`. Clawake does not roll back; inspect
+`--action status --execute` and the journal, then fix the image or the `health` block.
+
+`--action status --execute` prints `health: <state>` and `restarts: <n>` after the
+systemd status.
+
 ## Member readiness and `status`
 
 `status` reports one readiness state per v1 member: `stopped`, `starting`, `ready`,
