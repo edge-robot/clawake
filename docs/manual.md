@@ -343,6 +343,19 @@ timestamp:
 - inventory copy: `<inventory stem>-<YYYYMMDDTHHMMSS.ffffffZ><inventory suffix>`, for
   example `team-20261020T093015.123987Z.json`, mode `0600`.
 
+Runtime archives contain the member's workspace and OpenClaw state. They are created
+with mode `0600` from the first byte; a failed write removes the partial archive. When
+Clawake creates `.backups/`, it creates it with mode `0700`. Clawake never changes the
+mode of an existing `.backups/`; if group or others can access it, every runtime backup
+prints to stderr:
+
+```text
+Warning: backup directory .backups is accessible by group or others; Clawake leaves its mode unchanged.
+```
+
+Run `chmod 700 .backups` to make it private. Previews create neither the directory nor
+an archive.
+
 A backup never replaces an existing file. If the target name already exists, the backup
 step fails with `Backup <path> already exists; refusing to overwrite it`. `upgrade` then
 changes no inventory and restarts the previous image.
