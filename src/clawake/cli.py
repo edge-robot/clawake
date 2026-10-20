@@ -896,8 +896,6 @@ def setup_quadlets(
         typer.echo("No rendered changes detected; starting only inactive members.")
 
     # Restart only changed members; start unchanged inactive ones (#5 problem 1).
-    # Architecture-Ref: clawake/docs/architecture.md#lifecycle-contracts
-    # The doc still says setup restarts unchanged members; ADR-003 item 3 supersedes it.
     outcomes = run_setup_actions(
         selected, actions, service, probes, echo=typer.echo, on_result=_print_result
     )
@@ -1000,8 +998,6 @@ def status_quadlets(
     timeout: WaitTimeout = None,
 ) -> None:
     """Aggregate per-member runtime status and readiness with optional JSON output."""
-    # Architecture-Ref: clawake/docs/architecture.md#ownership-and-isolation
-    # The doc still says status represents systemd state only; ADR-003 adds readiness.
     inventory = _load(config, validation_only=True)
     if inventory.version == 2:
         if wait or timeout is not None:
