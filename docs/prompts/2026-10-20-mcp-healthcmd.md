@@ -5,7 +5,7 @@ worktree: <workspace>/clawake-integrate (inside the devcontainer: /workspaces/cl
 issue: edge-robot/clawake#39
 architecture-ref: clawake/docs/architecture.md#lifecycle-contracts
 base-commit: 85079c8 (main after PR #35)
-status: issued
+status: done
 ---
 # Onshape MCP service: per-image health command, image preflight, post-apply health wait (#39)
 
