@@ -153,9 +153,9 @@ def _update_image_fields(
         image = dict(next(item for item in data[section] if item["name"] == instance_name)["image"])
         image.update(values)
         replacement = yaml.safe_dump(image, default_flow_style=True, sort_keys=False).strip()
-        config_path.write_text(
+        _write_text_atomic(
+            config_path,
             raw[: image_node.start_mark.index] + replacement + raw[image_node.end_mark.index :],
-            encoding="utf-8",
         )
         return
     image_index = image_key.start_mark.line
@@ -187,7 +187,7 @@ def _update_image_fields(
                 for existing_key, existing_index in positions.items()
             }
 
-    config_path.write_text("".join(lines), encoding="utf-8")
+    _write_text_atomic(config_path, "".join(lines))
 
 
 def _plan_from_image(

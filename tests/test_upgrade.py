@@ -269,3 +269,61 @@ def test_same_tag_without_digest_keeps_the_current_digest(tmp_path: Path) -> Non
     plan = build_upgrade_plan(config, "one", next_tag="old", next_digest=None)
 
     assert (plan.next_tag, plan.next_digest) == ("old", "sha256:old")
+
+
+# --- #30: YAML inventory writes are atomic ----------------------------------------------------
+
+_BLOCK_YAML = """# operator comment
+instances:
+  - name: one
+    image:
+      repository: ghcr.io/openclaw/openclaw
+      tag: "old" # pinned by hand
+      digest: sha256:old
+"""
+
+_FLOW_YAML = """instances:
+  - name: one
+    image: {repository: ghcr.io/openclaw/openclaw, tag: old, digest: 'sha256:old'}
+    labels: {a: b}
+"""
+
+
+@pytest.mark.parametrize("original", [_BLOCK_YAML, _FLOW_YAML], ids=["block", "flow"])
+def test_interrupted_yaml_replace_leaves_the_original_inventory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, original: str
+) -> None:
+    from clawake.services import upgrade
+
+    config = tmp_path / "team.yml"
+    config.write_text(original, encoding="utf-8")
+    config.chmod(0o640)
+
+    def interrupted_replace(source: object, target: object) -> None:
+        raise OSError("synthetic interruption before rename")
+
+    monkeypatch.setattr(upgrade.os, "replace", interrupted_replace)
+
+    with pytest.raises(OSError, match="synthetic interruption"):
+        apply_upgrade(config, "one", "new", "sha256:new")
+
+    assert config.read_text(encoding="utf-8") == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["team.yml"]
+
+
+def test_flow_style_yaml_upgrade_output_is_unchanged(tmp_path: Path) -> None:
+    config = tmp_path / "team.yml"
+    config.write_text(_FLOW_YAML, encoding="utf-8")
+    config.chmod(0o640)
+
+    apply_upgrade(config, "one", "new", "sha256:new")
+
+    assert config.read_text(encoding="utf-8") == (
+        "instances:\n"
+        "  - name: one\n"
+        "    image: {repository: ghcr.io/openclaw/openclaw, tag: new, digest: 'sha256:new',"
+        " known_good_tag: old,\n"
+        "  known_good_digest: 'sha256:old'}\n"
+        "    labels: {a: b}\n"
+    )
+    assert config.stat().st_mode & 0o777 == 0o640
