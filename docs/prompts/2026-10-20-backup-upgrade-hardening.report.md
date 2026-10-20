@@ -260,3 +260,119 @@ at the next live run.
 - `src/clawake/cli.py:862`: the `setup --adopt` backup only catches `OSError`, while
   `rollout` also catches `tarfile.TarError`. A tar error would surface as a traceback
   instead of "Nothing was changed". Not changed.
+
+## P5b 2026-10-20
+
+Prompt: `docs/prompts/2026-10-20-private-runtime-backups.md` (edge-robot/clawake#34).
+Base `08fd64c` (612 passed, 2 skipped). Commits `0b25c61..e50cc44`, plus the commit adding
+the prompt and this section. Status: done. `e2e-request` stays `recommended`: the
+`--execute` paths only change file and directory modes and one error branch; the
+architect checks `ls -l .backups/` at the next live run.
+
+| sha | purpose |
+|---|---|
+| 0b25c61 | 0600 archives, 0700 directories, open-directory warning, side-effect-free preview |
+| 38dcac7 | `setup --adopt` catches `tarfile.TarError` around the member backup |
+| e50cc44 | manual |
+
+### Changed files (vs. `08fd64c`)
+
+| file | purpose |
+|---|---|
+| `src/clawake/services/backup.py` | `_create_private_file`, `ensure_backup_dir`, `BACKUP_DIR_MODE`; archive written via `fileobj`; partial archive removed; preview creates nothing |
+| `src/clawake/services/upgrade.py` | `backup_config` creates a new directory with 0700 |
+| `src/clawake/services/runtime_pins.py` | `copy_overlay` creates a new directory with 0700 |
+| `src/clawake/cli.py` | adoption backup catches `(OSError, tarfile.TarError)` |
+| `tests/test_backup.py` | six new tests (mode, directory, warning, preview, partial file) |
+| `tests/test_upgrade.py`, `tests/test_runtime_pins.py` | directory mode of `backup_config` / `copy_overlay` |
+| `tests/test_discord_channel.py` | `TarError` during the adoption backup |
+| `docs/manual.md` | archive mode, directory mode, warning text, preview |
+
+### Checks
+
+| command | result |
+|---|---|
+| `uv sync --locked` | pass (`Checked 21 packages`) |
+| `uv run ruff check .` | pass (`All checks passed!`) |
+| `uv run ruff format --check .` | pass (`52 files already formatted`) |
+| `uv run pytest -q` | pass, 621 passed, 2 skipped (base 612 + 9 new) |
+| `uv lock --check` | pass (`Resolved 29 packages`) |
+
+### Tests before and after the fix
+
+| test | before | after |
+|---|---|---|
+| `test_backup.py::test_runtime_archive_is_created_with_mode_0600` (umask 0o022) | fail (`420 == 384`, i.e. 0644) | pass |
+| `test_backup.py::test_new_backup_directory_is_created_with_mode_0700` | fail (`493 == 448`, 0755) | pass |
+| `test_backup.py::test_open_existing_backup_directory_is_kept_and_warned_about` | fail (archive 0644, no warning) | pass |
+| `test_backup.py::test_private_existing_backup_directory_gives_no_warning` | pass (guard) | pass |
+| `test_backup.py::test_runtime_backup_preview_creates_no_directory` | fail (directory created) | pass |
+| `test_backup.py::test_failure_while_writing_the_archive_leaves_no_partial_file` | fail (partial `.tar.gz` left) | pass |
+| `test_upgrade.py::test_backup_config_creates_a_new_backup_directory_with_mode_0700` | fail (0755) | pass |
+| `test_runtime_pins.py::test_copy_overlay_creates_a_new_backup_directory_with_mode_0700` | fail (0755) | pass |
+| `test_discord_channel.py::test_tar_error_in_adoption_backup_stops_cleanly_before_any_write` | fail (uncaught `TarError`) | pass |
+| `test_backup.py::test_runtime_backup_fails_closed_when_the_archive_exists` (#29) | pass | pass, unchanged |
+
+The `TarError` test also asserts exit 1, `SystemExit` as the exception, no `Traceback`,
+an unchanged tree snapshot and no host calls (nothing retired, deployed or reloaded).
+
+### Mutation checks
+
+- Archive created with `tarfile.open(archive_path, "x:gz")` again (temporary edit,
+  restored): `test_runtime_archive_is_created_with_mode_0600` and
+  `test_open_existing_backup_directory_is_kept_and_warned_about` fail, and so does the
+  #29 collision test, because the plain `"x"` mode loses the collision message.
+- `except (OSError, tarfile.TarError)` reduced to `except OSError` in `setup` (temporary
+  edit, restored): `test_tar_error_in_adoption_backup_stops_cleanly_before_any_write`
+  fails.
+
+### Exact texts
+
+- Directory warning (stderr, one line, path only; printed by every runtime backup into
+  an existing directory with any group/other bit):
+  `Warning: backup directory <path> is accessible by group or others; Clawake leaves its mode unchanged.`
+- Adoption backup failure (stderr, exit 1), the same text as for `OSError`:
+  `Backup before adopting <names> for <member> failed: <error>. Nothing was changed.`
+  `rollout` uses its own wording (`Backup failed for <member>: <error>`); the existing
+  `setup` text was kept so that both error types give the same message.
+- Collision (unchanged, #29): `Backup <path> already exists; refusing to overwrite it`.
+
+### Behaviour changes for operators
+
+- Runtime archives `.backups/<member>-<stamp>.tar.gz` are mode 0600 (were umask, usually
+  0644). Archive contents and names are unchanged. The gzip header no longer carries the
+  original file name, because the archive is written through a file descriptor; the tar
+  entries are identical.
+- A new `.backups/` is created with mode 0700 by `upgrade`, `rollout` and `setup --adopt`.
+  An existing `.backups/` keeps its mode; if it is open to group or others, each runtime
+  backup prints the warning above. Fix: `chmod 700 .backups`.
+- A failed archive write removes the partial archive and reports the error.
+- `setup --adopt ... --execute`: a tar error in the member backup now exits 1 with the
+  message above instead of a traceback.
+- No CLI flag, preview output, default or other exit code changed.
+
+### Live E2E request (recommended)
+
+At the next live run that writes a backup (e.g. `rollout ... --execute` or
+`upgrade ... --execute`), run `ls -ld .backups && ls -l .backups/`. Expected: new
+`*.tar.gz` files `-rw-------`; if `.backups/` was `drwxr-xr-x`, the run prints the warning
+once per runtime backup and the directory mode is unchanged. Earlier archives keep their
+old mode; tighten them with `chmod 600 .backups/*.tar.gz` if wanted.
+
+### Open points and risks
+
+- Existing archives written before this change remain 0644. Clawake does not change
+  them (no chmod of existing files, by the prompt's constraint).
+- `copy_overlay` and `backup_config` create the directory with 0700 but do not warn about
+  an open existing one; the warning comes from `backup_instance`. `runtime_pins` cannot
+  import `backup` (import cycle via `config`). A rollout that only changes pins and
+  backs up no member therefore prints no warning.
+- The directory mode of a new `.backups/` is `0700 & ~umask`; an unusual umask that
+  clears owner bits would make it unusable. Not handled.
+
+### Out-of-scope findings
+
+- `src/clawake/cli.py:667`: `upgrade_member` catches
+  `(ImageCheckError, OSError, RuntimeError, ValueError)`, not `tarfile.TarError`. A tar
+  error in the runtime backup (`cli.py:602`) would surface as a traceback, before any
+  mutation. Not changed.
