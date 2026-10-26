@@ -1,0 +1,9 @@
+[Quadlet]
+DefaultDependencies=false
+
+[Unit]
+Description=Clawake shared network clawonshape-mcp-private
+
+[Network]
+NetworkName=clawonshape-mcp-private
+NetworkDeleteOnStop=true

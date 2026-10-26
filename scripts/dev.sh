@@ -104,6 +104,16 @@ case "$git_common" in
     ;;
 esac
 
+# A container whose processes died without podman noticing (launcher killed together with
+# conmon) stays "running" forever and cannot be removed without force; clear those first.
+for c in $(podman ps -q --filter "name=^$NAME_PREFIX-"); do
+  pid=$(podman inspect -f '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+  if [[ "$pid" -le 0 || ! -d "/proc/$pid" ]]; then
+    echo "dev.sh: removing stale container $c (process $pid is gone)" >&2
+    podman rm -f "$c" >/dev/null || true
+  fi
+done
+
 [[ $# -gt 0 ]] || set -- bash
 # Herdr recognises agents by argv[0]; podman hides the containerised claude process from
 # it, so present the launcher as "claude" when it starts Claude Code.
