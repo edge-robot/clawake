@@ -104,14 +104,24 @@ case "$git_common" in
     ;;
 esac
 
-# A container whose processes died without podman noticing (launcher killed together with
-# conmon) stays "running" forever and cannot be removed without force; clear those first.
-for c in $(podman ps -q --filter "name=^$NAME_PREFIX-"); do
+# Clear containers nobody can reach any more, otherwise they pile up next to the new one:
+# - processes died without podman noticing (launcher killed together with conmon): the
+#   container stays "running" forever and cannot be removed without force;
+# - the launcher (whose PID is the name suffix) is gone, e.g. its pane was closed, but
+#   conmon keeps the container alive and claude waits on a TTY nobody is attached to.
+#   Matching the name in its argv guards against a reused PID.
+for c in $(podman ps --format '{{.Names}}' --filter "name=^$NAME_PREFIX-"); do
   pid=$(podman inspect -f '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+  launcher=${c##*-}
   if [[ "$pid" -le 0 || ! -d "/proc/$pid" ]]; then
-    echo "dev.sh: removing stale container $c (process $pid is gone)" >&2
-    podman rm -f "$c" >/dev/null || true
+    reason="process $pid is gone"
+  elif ! tr '\0' '\n' 2>/dev/null <"/proc/$launcher/cmdline" | grep -qxF -- "$c"; then
+    reason="launcher $launcher is gone"
+  else
+    continue
   fi
+  echo "dev.sh: removing stale container $c ($reason)" >&2
+  podman rm -f "$c" >/dev/null || true
 done
 
 [[ $# -gt 0 ]] || set -- bash
