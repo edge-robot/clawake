@@ -110,9 +110,10 @@ esac
 # - the launcher (whose PID is the name suffix) is gone, e.g. its pane was closed, but
 #   conmon keeps the container alive and claude waits on a TTY nobody is attached to.
 #   Matching the name in its argv guards against a reused PID.
-for c in $(podman ps --format '{{.Names}}' --filter "name=^$NAME_PREFIX-"); do
+for c in $(podman ps --format '{{.Names}}' --filter "name=^$NAME_PREFIX-[0-9]+$"); do
   pid=$(podman inspect -f '{{.State.Pid}}' "$c" 2>/dev/null) || continue
   launcher=${c##*-}
+  [[ "$launcher" =~ ^[0-9]+$ ]] || continue   # only containers this script named (PID suffix)
   if [[ "$pid" -le 0 || ! -d "/proc/$pid" ]]; then
     reason="process $pid is gone"
   elif ! tr '\0' '\n' 2>/dev/null <"/proc/$launcher/cmdline" | grep -qxF -- "$c"; then
