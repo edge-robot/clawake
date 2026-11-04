@@ -2,13 +2,87 @@
 
 from __future__ import annotations
 
+import json
+import re
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from clawake.config import BaseModel, HostPath, NetworkSpec, ResourceName, ServiceImageSpec
 from clawake.services.deployment import ArtifactChange
+from clawake.services.readiness import run_command
 from clawake.services.render import render_shared_network
+from clawake.services.systemd import CommandResult, SystemdService
+
+# The health check rendered before #39. Without a `health` block the quadlet stays byte-identical.
+DEFAULT_HEALTH_COMMAND = ["curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+_ABSOLUTE_EXECUTABLE = re.compile(r"/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
+_BARE_EXECUTABLE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+
+
+class OnshapeMcpHealth(BaseModel):
+    """Container health check; `command` runs without a shell (exec form), except the legacy curl
+    default, which keeps Podman's shell form for a byte-identical quadlet."""
+
+    command: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_HEALTH_COMMAND), min_length=1, max_length=16
+    )
+    interval_s: int = Field(default=30, ge=1, le=3600)
+    timeout_s: int = Field(default=5, ge=1, le=600)
+    retries: int = Field(default=3, ge=1, le=100)
+    start_period_s: int = Field(default=0, ge=0, le=3600)
+
+    @field_validator("command")
+    @classmethod
+    def safe_command(cls, command: list[str]) -> list[str]:
+        for argument in command:
+            # `%` and `$` would be expanded by systemd in the generated ExecStart line.
+            if not argument or not argument.isprintable() or "%" in argument or "$" in argument:
+                raise ValueError(
+                    "Health command arguments must be non-empty single-line text without '%' or '$'"
+                )
+        executable = command[0]
+        if not (
+            _ABSOLUTE_EXECUTABLE.fullmatch(executable) or _BARE_EXECUTABLE.fullmatch(executable)
+        ):
+            raise ValueError("Health command must start with an absolute path or executable name")
+        return command
+
+    @property
+    def shell_form(self) -> bool:
+        """Only the legacy default keeps Podman's shell form, for a byte-identical quadlet."""
+        return self.command == DEFAULT_HEALTH_COMMAND
+
+    def health_cmd(self) -> str:
+        if self.shell_form:
+            return " ".join(self.command)
+        # A JSON array starting with "CMD" is exec form: Podman runs it without /bin/sh.
+        return json.dumps(["CMD", *self.command], separators=(",", ":"))
+
+    def preflight_executables(self) -> list[str]:
+        """Executables the image must provide for this health check to run."""
+        if self.shell_form:
+            return ["/bin/sh", self.command[0]]
+        return [self.command[0]]
+
+    def quadlet_lines(self) -> list[str]:
+        lines = [
+            f"HealthCmd={self.health_cmd()}",
+            f"HealthInterval={self.interval_s}s",
+            f"HealthTimeout={self.timeout_s}s",
+            f"HealthRetries={self.retries}",
+        ]
+        if self.start_period_s > 0:
+            lines.append(f"HealthStartPeriod={self.start_period_s}s")
+        lines.append("HealthOnFailure=kill")
+        return lines
+
+
+# Contract path of the server's dispatch journal (onshape-mcp.md §1, §12.1).
+DISPATCH_JOURNAL_CONTAINER_PATH = "/var/lib/onshape-mcp/journal"
 
 
 class OnshapeMcpSpec(BaseModel):
@@ -19,14 +93,19 @@ class OnshapeMcpSpec(BaseModel):
     credential_directory: HostPath
     config_file: HostPath
     quadlet_root: HostPath
+    # Optional persistent, server-only rw journal for goal authorization (#40).
+    dispatch_journal_directory: HostPath | None = None
     memory_mb: int = Field(default=512, ge=128, le=4096)
     cpu_quota_percent: int = Field(default=100, ge=10, le=400)
+    health: OnshapeMcpHealth = Field(default_factory=OnshapeMcpHealth)
 
     @model_validator(mode="after")
     def pinned(self) -> OnshapeMcpSpec:
         if not self.image.digest:
             raise ValueError("Onshape MCP requires an immutable image digest")
         paths = [Path(self.credential_directory), Path(self.config_file), Path(self.quadlet_root)]
+        if self.dispatch_journal_directory is not None:
+            paths.append(Path(self.dispatch_journal_directory))
         if any(
             a == b or a.is_relative_to(b) or b.is_relative_to(a)
             for i, a in enumerate(paths)
@@ -36,11 +115,22 @@ class OnshapeMcpSpec(BaseModel):
         return self
 
 
+def image_reference(spec: OnshapeMcpSpec) -> str:
+    return f"{spec.image.repository}:{spec.image.tag}@{spec.image.digest}"
+
+
 def render_onshape_mcp(spec: OnshapeMcpSpec) -> dict[str, str]:
-    image = f"{spec.image.repository}:{spec.image.tag}@{spec.image.digest}"
+    image = image_reference(spec)
+    health = "\n".join(spec.health.quadlet_lines())
     network = render_shared_network(
         NetworkSpec(name=spec.network, host="local", quadlet_default_dependencies=False)
     )
+    # Optional server-only rw journal, rendered right after the existing volumes (#40).
+    journal_volume = ""
+    if spec.dispatch_journal_directory is not None:
+        journal_volume = (
+            f"\nVolume={spec.dispatch_journal_directory}:{DISPATCH_JOURNAL_CONTAINER_PATH}:rw"
+        )
     # Network egress is required for cad.onshape.com; no published inbound port.
     container = f"""[Quadlet]
 DefaultDependencies=false
@@ -61,13 +151,9 @@ ReadOnly=true
 NoNewPrivileges=true
 DropCapability=all
 Volume={spec.credential_directory}:/run/onshape-credentials:ro
-Volume={spec.config_file}:/run/onshape-config/config.toml:ro
+Volume={spec.config_file}:/run/onshape-config/config.toml:ro{journal_volume}
 Exec=--config /run/onshape-config/config.toml http
-HealthCmd=curl --fail --silent http://127.0.0.1:8080/health
-HealthInterval=30s
-HealthTimeout=5s
-HealthRetries=3
-HealthOnFailure=kill
+{health}
 PodmanArgs=--pids-limit=128 --tmpfs=/tmp:rw,noexec,nosuid,size=16m
 
 [Service]
@@ -81,6 +167,168 @@ CPUQuota={spec.cpu_quota_percent}%
 WantedBy=default.target
 """
     return {f"{spec.network}.network": network, f"{spec.name}.container": container}
+
+
+class McpHealthError(ValueError):
+    """A fail-closed health preflight or health wait result; the message is operator-ready."""
+
+
+@dataclass(frozen=True)
+class McpProbes:
+    """Injectable seams for every podman/systemctl call of the MCP health lifecycle."""
+
+    run: Callable[[list[str], float], CommandResult]
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+
+
+def default_mcp_probes() -> McpProbes:
+    return McpProbes(run=run_command)
+
+
+PREFLIGHT_TIMEOUT_SECONDS = 60.0
+# podman run: 125 is a Podman error, 126/127 mean the contained command cannot be invoked or
+# found. Every other exit code comes from the executable itself, so it exists.
+_PODMAN_ERROR = 125
+_COMMAND_NOT_RUNNABLE = frozenset({126, 127})
+
+
+def preflight_command(spec: OnshapeMcpSpec, executable: str) -> list[str]:
+    """Read-only check that the image can execute `executable`: no volumes, no network."""
+    return [
+        "podman",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network=none",
+        "--entrypoint",
+        executable,
+        image_reference(spec),
+        "--help",
+    ]
+
+
+def preflight_health_command(spec: OnshapeMcpSpec, probes: McpProbes) -> None:
+    """Fail closed unless the pinned image can run every executable of the health check."""
+    image = image_reference(spec)
+    for executable in spec.health.preflight_executables():
+        result = probes.run(preflight_command(spec, executable), PREFLIGHT_TIMEOUT_SECONDS)
+        # run_command reports a missing podman binary as 127 with the exception class name.
+        if result.return_code == 127 and result.stderr == "FileNotFoundError":
+            raise McpHealthError("Onshape MCP preflight failed: podman is not available")
+        if result.return_code == 124 and result.stderr == "timeout":
+            raise McpHealthError(
+                f"Onshape MCP preflight for image {image} and health command {executable} "
+                f"timed out after {PREFLIGHT_TIMEOUT_SECONDS:g}s"
+            )
+        if result.return_code in _COMMAND_NOT_RUNNABLE:
+            raise McpHealthError(
+                f"Onshape MCP image {image} cannot run health command {executable}: "
+                f"executable missing or not runnable (podman exit {result.return_code})"
+            )
+        if result.return_code == _PODMAN_ERROR:
+            raise McpHealthError(
+                f"Onshape MCP preflight could not run image {image} for health command "
+                f"{executable}: podman exit {_PODMAN_ERROR} (the image must be in local storage)"
+            )
+
+
+HEALTH_POLL_SECONDS = 2.0
+HEALTH_PROBE_TIMEOUT_SECONDS = 10.0
+HEALTH_WAIT_MARGIN_SECONDS = 30
+_HEALTH_STATUS = re.compile(r"[a-z]{1,32}")
+
+
+def health_wait_window(spec: OnshapeMcpSpec) -> int:
+    """Bounded post-apply wait: start period, every allowed failed probe plus one, 30 s margin."""
+    health = spec.health
+    return (
+        health.start_period_s
+        + health.interval_s * (health.retries + 1)
+        + (HEALTH_WAIT_MARGIN_SECONDS)
+    )
+
+
+def health_status_command(spec: OnshapeMcpSpec) -> list[str]:
+    return ["podman", "inspect", "--format", "{{.State.Health.Status}}", spec.name]
+
+
+def restart_count_command(spec: OnshapeMcpSpec) -> list[str]:
+    unit = SystemdService.unit_name(spec.name)
+    return ["systemctl", "--user", "show", "--property=NRestarts", "--value", unit]
+
+
+def read_health_status(spec: OnshapeMcpSpec, probes: McpProbes, timeout: float) -> str:
+    """The Podman health state, or ``unknown``; never echoes free text."""
+    result = probes.run(health_status_command(spec), timeout)
+    value = result.stdout.strip()
+    if result.return_code or not _HEALTH_STATUS.fullmatch(value):
+        return "unknown"
+    return value
+
+
+def read_restart_count(spec: OnshapeMcpSpec, probes: McpProbes, timeout: float) -> int | None:
+    """systemd's automatic restart counter of the unit, or ``None`` when unreadable."""
+    result = probes.run(restart_count_command(spec), timeout)
+    value = result.stdout.strip()
+    if result.return_code or not value.isdigit():
+        return None
+    return int(value)
+
+
+@dataclass(frozen=True)
+class McpHealthOutcome:
+    healthy: bool
+    state: str
+    restarts: int | None
+    elapsed: float
+
+    def message(self) -> str:
+        if self.healthy:
+            return (
+                f"Onshape MCP service healthy after {round(self.elapsed)}s; "
+                "credential readiness unverified"
+            )
+        restarts = "+?" if self.restarts is None else f"{self.restarts:+d}"
+        return f"Onshape MCP service not healthy: {self.state}, restarts {restarts}"
+
+
+def wait_healthy(spec: OnshapeMcpSpec, probes: McpProbes) -> McpHealthOutcome:
+    """Poll until ``healthy`` without new restarts, ``unhealthy``, a restart, or the window ends.
+
+    Read-only and bounded by `health_wait_window`; every probe has its own timeout. Nothing is
+    stopped or rolled back here: the operator decides what to do with a failure.
+    """
+    window = health_wait_window(spec)
+    start = probes.clock()
+    deadline = start + window
+
+    def probe_timeout() -> float:
+        return max(1.0, min(HEALTH_PROBE_TIMEOUT_SECONDS, deadline - probes.clock()))
+
+    baseline = read_restart_count(spec, probes, probe_timeout())
+    if baseline is None:
+        return McpHealthOutcome(False, "restart count unavailable", None, 0.0)
+    while True:
+        state = read_health_status(spec, probes, probe_timeout())
+        count = read_restart_count(spec, probes, probe_timeout())
+        elapsed = probes.clock() - start
+        if count is None:
+            return McpHealthOutcome(False, "restart count unavailable", None, elapsed)
+        restarts = count - baseline
+        # A changed counter means systemd restarted the service during the wait (#39).
+        if restarts != 0:
+            return McpHealthOutcome(False, state, restarts, elapsed)
+        if state == "healthy":
+            return McpHealthOutcome(True, state, restarts, elapsed)
+        if state == "unhealthy":
+            return McpHealthOutcome(False, state, restarts, elapsed)
+        remaining = deadline - probes.clock()
+        if remaining <= 0:
+            return McpHealthOutcome(
+                False, f"timeout after {window}s (last state {state})", restarts, elapsed
+            )
+        probes.sleep(min(HEALTH_POLL_SECONDS, remaining))
 
 
 def plan_onshape_mcp(spec: OnshapeMcpSpec) -> list[ArtifactChange]:
@@ -100,7 +348,10 @@ def validate_runtime_paths(spec: OnshapeMcpSpec) -> None:
     import os
     import stat
 
-    for value, directory in [(spec.credential_directory, True), (spec.config_file, False)]:
+    checked = [(spec.credential_directory, True), (spec.config_file, False)]
+    if spec.dispatch_journal_directory is not None:
+        checked.append((spec.dispatch_journal_directory, True))
+    for value, directory in checked:
         item = Path(value)
         metadata = item.lstat()
         if (
@@ -111,6 +362,48 @@ def validate_runtime_paths(spec: OnshapeMcpSpec) -> None:
             or (not directory and not stat.S_ISREG(metadata.st_mode))
         ):
             raise ValueError("MCP runtime path requires private owner permissions")
+
+
+def check_journal_config(spec: OnshapeMcpSpec, config_text: str) -> None:
+    """Check that the server's goal keys and the declared journal mount agree.
+
+    Pure: parses the config.toml text and interprets only `goal_grant_file` and
+    `dispatch_journal_dir` in `[external_token]` (onshape-mcp.md §12.1). Messages
+    name keys only and never echo values from the config.
+    """
+    import tomllib
+
+    try:
+        document = tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError:
+        # The decoder message can quote config text; report the file only.
+        raise ValueError("MCP config.toml is not valid TOML") from None
+    section = document.get("external_token")
+    if not isinstance(section, dict):
+        section = {}
+    grant_set = "goal_grant_file" in section
+    journal_key_set = "dispatch_journal_dir" in section
+    declared = spec.dispatch_journal_directory is not None
+    if grant_set and not declared:
+        raise ValueError(
+            "MCP config sets external_token.goal_grant_file, but the service declares "
+            "no dispatch_journal_directory"
+        )
+    if declared and section.get("dispatch_journal_dir") != DISPATCH_JOURNAL_CONTAINER_PATH:
+        raise ValueError(
+            "MCP service declares dispatch_journal_directory, but external_token."
+            f"dispatch_journal_dir is not {DISPATCH_JOURNAL_CONTAINER_PATH}"
+        )
+    if journal_key_set and not declared:
+        raise ValueError(
+            "MCP config sets external_token.dispatch_journal_dir, but the service declares "
+            "no dispatch_journal_directory"
+        )
+
+
+def validate_journal_config(spec: OnshapeMcpSpec) -> None:
+    """Read only the operator's config.toml; grant, approval and token files stay unread."""
+    check_journal_config(spec, Path(spec.config_file).read_text())
 
 
 def probe_native(spec: OnshapeMcpSpec) -> dict:

@@ -118,6 +118,34 @@ known local native server in disabled state; activation/agent invocation still
 requires its separate supported authority boundary. See Claw-Onshape's
 self-hosted-mcp-architecture.md for the exact mode and credential contract.
 
+**Goal dispatch journal (#40, contract 1.1.0 §1, §12).** The optional
+`dispatch_journal_directory: <journal-dir>` (absolute host path, disjoint from the other
+MCP paths and the Quadlet root) adds exactly one line to the Quadlet,
+`Volume=<journal-dir>:/var/lib/onshape-mcp/journal:rw`. Only the MCP container mounts it.
+Without the field the Quadlet is unchanged. `plan` and `apply` parse the service's
+`config.toml` and check only two keys in `[external_token]`:
+
+- `goal_grant_file` without a declared `dispatch_journal_directory` fails;
+- a declared `dispatch_journal_directory` requires
+  `dispatch_journal_dir = "/var/lib/onshape-mcp/journal"`;
+- `dispatch_journal_dir` without a declared `dispatch_journal_directory` fails, because
+  the path would be on the read-only root file system.
+
+Errors name the key only. The grant file lives next to the approval file in the existing
+ro credential mount, so it needs no extra mount. Clawake never reads the grant, approval,
+token or journal files. `apply --execute` requires the journal directory to exist as a
+real directory (not a symlink), owned by the operator, with no group or other permission
+bits (`chmod 0700`). With `UserNS=keep-id:uid=1000,gid=1000` the operator's UID appears
+as the server's runtime UID 1000 in the container; the server rejects a journal that its
+UID does not own and then omits `goal-grant-v1` from `/capabilities`. See #16 for the
+UID mapping.
+
+The journal is the server's only state and persists across restarts and image upgrades.
+The operator must back it up: neither `upgrade` nor `rollout` backups include it,
+because the MCP service is operated outside member upgrades. A lost or corrupt journal
+does not reset goal budgets. It blocks goal admission (`dispatch_journal_unavailable`)
+until the operator restores it.
+
 ## Operation examples
 
 ```bash

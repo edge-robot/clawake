@@ -104,6 +104,27 @@ case "$git_common" in
     ;;
 esac
 
+# Clear containers nobody can reach any more, otherwise they pile up next to the new one:
+# - processes died without podman noticing (launcher killed together with conmon): the
+#   container stays "running" forever and cannot be removed without force;
+# - the launcher (whose PID is the name suffix) is gone, e.g. its pane was closed, but
+#   conmon keeps the container alive and claude waits on a TTY nobody is attached to.
+#   Matching the name in its argv guards against a reused PID.
+for c in $(podman ps --format '{{.Names}}' --filter "name=^$NAME_PREFIX-[0-9]+$"); do
+  pid=$(podman inspect -f '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+  launcher=${c##*-}
+  [[ "$launcher" =~ ^[0-9]+$ ]] || continue   # only containers this script named (PID suffix)
+  if [[ "$pid" -le 0 || ! -d "/proc/$pid" ]]; then
+    reason="process $pid is gone"
+  elif ! tr '\0' '\n' 2>/dev/null <"/proc/$launcher/cmdline" | grep -qxF -- "$c"; then
+    reason="launcher $launcher is gone"
+  else
+    continue
+  fi
+  echo "dev.sh: removing stale container $c ($reason)" >&2
+  podman rm -f "$c" >/dev/null || true
+done
+
 [[ $# -gt 0 ]] || set -- bash
 # Herdr recognises agents by argv[0]; podman hides the containerised claude process from
 # it, so present the launcher as "claude" when it starts Claude Code.

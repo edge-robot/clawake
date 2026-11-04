@@ -1342,10 +1342,14 @@ def onshape_mcp(
     execute: ExecuteFlag = False,
 ) -> None:
     """Operate the isolated external-token MCP service; never handle OAuth tokens."""
+    from clawake.services import onshape_mcp as mcp
     from clawake.services.onshape_mcp import (
+        McpHealthError,
         OnshapeMcpSpec,
         plan_onshape_mcp,
+        preflight_health_command,
         probe_native,
+        validate_journal_config,
         validate_runtime_paths,
     )
 
@@ -1369,10 +1373,35 @@ def onshape_mcp(
         typer.echo(" ".join(result.command))
         if execute:
             typer.echo(f"exit={result.return_code}")
+        if action == "status":
+            # #39: the health state and the restart counter, read-only.
+            if execute:
+                probes = mcp.default_mcp_probes()
+                timeout = mcp.HEALTH_PROBE_TIMEOUT_SECONDS
+                restarts = mcp.read_restart_count(spec, probes, timeout)
+                typer.echo(f"health: {mcp.read_health_status(spec, probes, timeout)}")
+                typer.echo(f"restarts: {'unknown' if restarts is None else restarts}")
+            else:
+                typer.echo(" ".join(mcp.health_status_command(spec)))
+                typer.echo(" ".join(mcp.restart_count_command(spec)))
         if result.return_code:
             raise typer.Exit(1)
         return
+    probes = mcp.default_mcp_probes()
+    # #39: refuse an image that cannot run its health check, before anything is written.
+    try:
+        preflight_health_command(spec, probes)
+    except McpHealthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
     changes = plan_onshape_mcp(spec)
+    # The preview already fails when config.toml and the journal mount disagree (#40).
+    try:
+        validate_journal_config(spec)
+    except OSError as exc:
+        raise typer.BadParameter("Onshape MCP config.toml is not readable") from exc
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     for change in changes:
         typer.echo(f"{change.member}: {change.destination}")
     if action == "apply" and execute:
@@ -1385,7 +1414,13 @@ def onshape_mcp(
             result = operation()
             if result.return_code:
                 raise typer.BadParameter("Onshape MCP service start failed; inspect systemd")
-        typer.echo("Onshape MCP service configured and started; credential readiness unverified")
+        # #39: "started" is not success; wait for a healthy container that is not restarting.
+        typer.echo(f"Waiting up to {mcp.health_wait_window(spec)}s for Onshape MCP health")
+        outcome = mcp.wait_healthy(spec, probes)
+        if not outcome.healthy:
+            typer.echo(outcome.message(), err=True)
+            raise typer.Exit(code=1)
+        typer.echo(outcome.message())
 
 
 pins_app = typer.Typer(
