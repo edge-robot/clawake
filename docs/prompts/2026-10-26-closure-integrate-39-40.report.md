@@ -142,7 +142,7 @@ No `# noqa` or `# type: ignore` was added.
 
 Not changed, reported here instead:
 
-- Closure prompt line 73, `author Albert Kos <kickban3000@gmail.com>`. The same identity is
+- Closure prompt line 73, `author Albert Kos <<operator-git-email>>`. The same identity is
   already public as a commit author on `main` (`git log origin/main --format=%ae`), and the
   prompt requires it. It is not a new leak, and it is the architect's call.
 - **History:** `71e0315` (the prompt commit) still has the host path with the user name, and so

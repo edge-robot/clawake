@@ -70,7 +70,7 @@ hard-coded curl `HealthCmd`), green and ready for one pull request to `main`.
 
 Commit on `feat/40-goal-journal` only. Each commit has:
 
-- author `Albert Kos <kickban3000@gmail.com>`;
+- author `Albert Kos <<operator-git-email>>`;
 - the trailers `Refs: edge-robot/clawake#39`, `Refs: edge-robot/clawake#40`,
   `Prompt: docs/prompts/2026-10-26-closure-integrate-39-40.md`, `Agent: py-clawake-dev` and
   `Co-Authored-By`.

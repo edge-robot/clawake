@@ -24,7 +24,8 @@ _BARE_EXECUTABLE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
 
 
 class OnshapeMcpHealth(BaseModel):
-    """Container health check; `command` runs without a shell (exec form)."""
+    """Container health check; `command` runs without a shell (exec form), except the legacy curl
+    default, which keeps Podman's shell form for a byte-identical quadlet."""
 
     command: list[str] = Field(
         default_factory=lambda: list(DEFAULT_HEALTH_COMMAND), min_length=1, max_length=16
