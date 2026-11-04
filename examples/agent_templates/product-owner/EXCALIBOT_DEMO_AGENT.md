@@ -13,8 +13,8 @@ The demo story:
 
 ## Discord Target
 
-- Guild: `1475244093541191822`
-- Channel: `1514256860654600374`
+- Guild: `<discord-guild-id>`
+- Channel: `<discord-channel-id>`
 - Channel name: `#excalibot`
 
 ## Demo Trigger
